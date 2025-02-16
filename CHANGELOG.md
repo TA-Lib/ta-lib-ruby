@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Renamed main file from `lib/ta_lib.rb` to `lib/ta_lib_ffi.rb`
 - Updated require statements in specs and gemspec
 
-## [0.1.0] - 2024-01-21
+## [0.1.0] - 2025-01-21
 
 ### Added
 - Initial release of ta_lib_ffi

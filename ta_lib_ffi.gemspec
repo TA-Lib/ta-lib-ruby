@@ -11,7 +11,7 @@ Gem::Specification.new do |spec|
   spec.description = "A Ruby wrapper for TA-Lib using FFI, providing technical analysis functions for financial market data"
   spec.homepage = "https://github.com/TA-Lib/ta-lib-ruby"
   spec.license = "MIT"
-  spec.required_ruby_version = ">= 3.0.0"
+  spec.required_ruby_version = ">= 3.1.0"
   spec.metadata["allowed_push_host"] = "https://rubygems.org"
   spec.metadata["homepage_uri"] = spec.homepage
   spec.metadata["source_code_uri"] = "https://github.com/TA-Lib/ta-lib-ruby"
@@ -34,6 +34,7 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "rspec", "~> 3.13"
   spec.add_development_dependency "rubocop-rspec", "~> 3.3"
   spec.add_development_dependency "ruby-lsp-rspec", "~> 0.1.20"
+  spec.add_development_dependency "webrick", "~> 1.9"
 
   # For more information and examples about making a new gem, check out our
   # guide at: https://bundler.io/guides/creating_gem.html
