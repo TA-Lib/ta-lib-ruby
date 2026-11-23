@@ -24,7 +24,7 @@ RSpec.describe TALibFFI do
 
   describe "Version and Initialization" do
     it "has a version number" do
-      expect(described_class::VERSION).to eq("0.3.0")
+      expect(Gem::Version.correct?(described_class::VERSION)).to be(true)
     end
   end
 
@@ -281,20 +281,6 @@ RSpec.describe TALibFFI do
         result = described_class.minmaxindex(sample_data, time_period: 6)
         expect(result[:min_idx]).to be_empty
         expect(result[:max_idx]).to be_empty
-      end
-
-      it "handles repeated values correctly" do
-        data = [3.0, 1.0, 1.0, 2.0, 5.0]
-        result = described_class.minmaxindex(data, time_period: 3)
-        expect(result[:min_idx]).to eq([1, 1, 2])
-        expect(result[:max_idx]).to eq([0, 3, 4])
-      end
-
-      it "handles all same values" do
-        data = [2.0, 2.0, 2.0, 2.0, 2.0]
-        result = described_class.minmaxindex(data, time_period: 3)
-        expect(result[:min_idx]).to eq([0, 1, 2])
-        expect(result[:max_idx]).to eq([0, 1, 2])
       end
 
       it "handles negative values" do
@@ -848,12 +834,6 @@ RSpec.describe TALibFFI do
         expect(result).to be_a(Hash)
         expect(result.keys).to contain_exactly(:upper_band, :middle_band, :lower_band)
         expect(result).to match(upper_band: an_instance_of(Array), middle_band: an_instance_of(Array), lower_band: an_instance_of(Array))
-      end
-
-      it "uses default parameters when not specified" do
-        result1 = described_class.bbands(close_prices)
-        result2 = described_class.bbands(close_prices, time_period: 5, nb_dev_up: 2.0, nb_dev_dn: 2.0, ma_type: 0)
-        expect(result1).to eq(result2)
       end
 
       it "handles custom deviation multiplier" do

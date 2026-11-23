@@ -21,9 +21,18 @@ jobs:
         include:
           - os: ubuntu-latest
             ruby: '4'
+            ta_lib: '0.6.4'
+          - os: ubuntu-latest
+            ruby: '4'
+            ta_lib: '0.8.3'
+          - os: windows-latest
+            ruby: '4'
+            ta_lib: '0.8.3'
+          - os: macos-latest
+            ruby: '4'
 
     runs-on: ${{ matrix.os }}
-    name: Ruby ${{ matrix.ruby }} on ${{ matrix.os }}
+    name: Ruby ${{ matrix.ruby }} on ${{ matrix.os }} (TA-Lib ${{ matrix.ta_lib || (matrix.os == 'macos-latest' && 'Homebrew') || '0.6.4' }})
 
     steps:
     - uses: actions/checkout@v4
@@ -34,10 +43,11 @@ jobs:
 
     - name: Install TA-Lib on Ubuntu
       if: matrix.os == 'ubuntu-latest'
+      env:
+        TA_VERSION: ${{ matrix.ta_lib || '0.6.4' }}
       run: |
-        mkdir -p ta-lib
-        wget -P ta-lib https://github.com/ta-lib/ta-lib/releases/download/v0.6.4/ta-lib_0.6.4_amd64.deb
-        sudo dpkg -i ta-lib/ta-lib_0.6.4_amd64.deb
+        wget -O ta-lib.deb "https://github.com/ta-lib/ta-lib/releases/download/v${TA_VERSION}/ta-lib_${TA_VERSION}_amd64.deb"
+        sudo dpkg -i ta-lib.deb
 
     - name: Install TA-Lib on macOS
       if: matrix.os == 'macos-latest'
@@ -45,9 +55,12 @@ jobs:
 
     - name: Install TA-Lib on Windows
       if: matrix.os == 'windows-latest'
+      env:
+        TA_VERSION: ${{ matrix.ta_lib || '0.6.4' }}
       run: |
-        Invoke-WebRequest -Uri "https://github.com/ta-lib/ta-lib/releases/download/v0.6.4/ta-lib-0.6.4-windows-x86_64.msi" -OutFile "ta-lib.msi"
-        msiexec /i ta-lib.msi /quiet /norestart
+        Invoke-WebRequest -Uri "https://github.com/ta-lib/ta-lib/releases/download/v${env:TA_VERSION}/ta-lib-${env:TA_VERSION}-windows-x86_64.msi" -OutFile "ta-lib.msi"
+        $installer = Start-Process msiexec.exe -ArgumentList '/i', 'ta-lib.msi', '/quiet', '/norestart' -Wait -PassThru
+        if ($installer.ExitCode -notin 0, 3010) { exit $installer.ExitCode }
 
     - name: Set up Ruby
       uses: ruby/setup-ruby@v1

@@ -13,12 +13,13 @@ RuboCop::RakeTask.new
 task default: %i[spec rubocop]
 
 YARD::Rake::YardocTask.new do |t|
-  require_relative "lib/ta_lib_ffi"
-  require_relative "lib/ta_lib_ffi/doc"
-  TALibFFI::Doc.insert
+  t.before = lambda do
+    require_relative "lib/ta_lib_ffi"
+    require_relative "lib/ta_lib_ffi/doc"
+    TALibFFI::Doc.insert
+  end
 
   t.files = ["lib/**/*.rb"]
   t.options = ["--exclude", "lib/ta_lib_ffi/doc.rb"]
   t.stats_options = ["--list-undoc"]
-  # t.after = -> { TALibFFI::Doc.remove }
 end

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - Unreleased
+
+### Added
+
+- Support for the TA-Lib 0.8.3 function metadata layout and indicators, including ALMA, alongside 0.6.4. Set `TA_LIB_PATH` to select a particular shared library.
+- Direct C comparisons for the indicators in each installed library and Linux CI coverage for the latest stable Ruby 4.x.
+
+### Fixed
+
+- Fixed unbounded memory growth during repeated indicator calls. Numeric arrays are packed in bulk, and Ruby owns the input and output buffers for the duration of each call.
+- Invalid input counts, incorrectly grouped price fields, unequal lengths and unknown keywords raise `TALibFFI::TALibError` with details. Previously unknown keywords silently used the default.
+
+Indicator defaults and results follow the installed TA-Lib version. This includes the BBANDS default period and how MINMAXINDEX selects among equal extrema.
+
 ## [0.3.0] - 2025-02-23
 
 ### Added
@@ -54,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - N/A
 
+[0.4.0]: https://github.com/TA-Lib/ta-lib-ruby/compare/v0.3.0...main
 [0.3.0]: https://github.com/TA-Lib/ta-lib-ruby/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/TA-Lib/ta-lib-ruby/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/TA-Lib/ta-lib-ruby/releases/tag/v0.1.0

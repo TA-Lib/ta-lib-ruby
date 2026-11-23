@@ -2,6 +2,7 @@
 
 require "fiddle"
 require "fiddle/import"
+require "rubygems/version"
 require_relative "ta_lib_ffi/version"
 
 # Ruby FFI wrapper for TA-Lib (Technical Analysis Library)
@@ -36,17 +37,14 @@ module TALibFFI
 
   extend Fiddle::Importer
 
-  lib_path = case RUBY_PLATFORM
-             when /darwin/
-               brew_prefix = `brew --prefix`.chomp
-               "#{brew_prefix}/lib/libta-lib.dylib"
-             when /linux/
-               "libta-lib.so"
-             when /cygwin|mswin|mingw|bccwin|wince|emx/
-               "C:/Program Files/TA-Lib/bin/ta-lib.dll"
-             else
-               raise "Unsupported platform"
-             end
+  lib_path = ENV.fetch("TA_LIB_PATH") do
+    case RUBY_PLATFORM
+    when /darwin/ then "#{`brew --prefix`.chomp}/lib/libta-lib.dylib"
+    when /linux/ then "libta-lib.so"
+    when /cygwin|mswin|mingw|bccwin|wince|emx/ then "C:/Program Files/TA-Lib/bin/ta-lib.dll"
+    else raise "Unsupported platform: #{RUBY_PLATFORM}"
+    end
+  end
 
   dlload lib_path
 
@@ -72,16 +70,6 @@ module TALibFFI
   TA_INTERNAL_ERROR             = 5000
   TA_UNKNOWN_ERR                = 0xFFFF
 
-  # {0,"SMA"},
-  # {1,"EMA"},
-  # {2,"WMA"},
-  # {3,"DEMA" },
-  # {4,"TEMA" },
-  # {5,"TRIMA"},
-  # {6,"KAMA" },
-  # {7,"MAMA" },
-  # {8,"T3"}
-
   typealias "TA_Real", "double"
   typealias "TA_Integer", "int"
   typealias "TA_RetCode", "int"
@@ -101,11 +89,19 @@ module TALibFFI
     "void *hiddenData"
   ]
 
+  # TA-Lib 0.8.1 removed camelCaseName. Older Windows DLLs can omit
+  # TA_GetVersionString entirely and use the original struct layout.
+  version_export = handler.sym("TA_GetVersionString")
+  if version_export
+    version_string = Fiddle::Function.new(version_export, [], Fiddle::TYPE_VOIDP).call.to_s
+    native_version = Gem::Version.new(version_string.split.first)
+  end
+  legacy_func_info = !native_version || native_version < Gem::Version.new("0.8.1")
   TA_FuncInfo = struct [
     "const char *name",
     "const char *group",
     "const char *hint",
-    "const char *camelCaseName",
+    *(["const char *camelCaseName"] if legacy_func_info),
     "TA_FuncFlags flags",
     "unsigned int nbInput",
     "unsigned int nbOptInput",
@@ -152,6 +148,13 @@ module TALibFFI
     TA_Output_Integer: 1
   }.freeze
 
+  PRICE_FIELDS = %w[open high low close volume open_interest].freeze
+  OUTPUT_LAYOUTS = {
+    TA_PARAM_TYPE[:TA_Output_Real] => ["d", Fiddle::SIZEOF_DOUBLE, :TA_SetOutputParamRealPtr].freeze,
+    TA_PARAM_TYPE[:TA_Output_Integer] => ["i!", Fiddle::SIZEOF_INT, :TA_SetOutputParamIntegerPtr].freeze
+  }.freeze
+  private_constant :PRICE_FIELDS, :OUTPUT_LAYOUTS
+
   TA_FLAGS = {
     TA_InputFlags: {
       TA_IN_PRICE_OPEN: 0x00000001,
@@ -181,7 +184,10 @@ module TALibFFI
       TA_OUT_NEGATIVE: 0x00000200,
       TA_OUT_ZERO: 0x00000400,
       TA_OUT_UPPER_LIMIT: 0x00000800,
-      TA_OUT_LOWER_LIMIT: 0x00001000
+      TA_OUT_LOWER_LIMIT: 0x00001000,
+      TA_OUT_NULLABLE: 0x00002000,
+      TA_OUT_DISPLAY_SHIFT: 0x00004000,
+      TA_OUT_PATTERN_WEAK: 0x00008000
     }
   }.freeze
 
@@ -191,7 +197,7 @@ module TALibFFI
   extern "int TA_GroupTableFree(TA_StringTable*)"
   extern "TA_RetCode TA_FuncTableAlloc(const char *group, TA_StringTable **table)"
   extern "TA_RetCode TA_FuncTableFree(TA_StringTable *table)"
-  extern "TA_FuncHandle TA_GetFuncHandle(const char *name, const TA_FuncHandle **handle)"
+  extern "TA_RetCode TA_GetFuncHandle(const char *name, const TA_FuncHandle **handle)"
   extern "TA_RetCode TA_GetFuncInfo(const TA_FuncHandle *handle, const TA_FuncInfo **funcInfo)"
   extern "TA_RetCode TA_ForEachFunc(TA_CallForEachFunc functionToCall, void *opaqueData)"
   extern "TA_RetCode TA_GetInputParameterInfo(const TA_FuncHandle *handle, unsigned int paramIndex, const TA_InputParameterInfo **info)"
@@ -229,26 +235,34 @@ module TALibFFI
   # @param type [Symbol] The type of flags to extract (:TA_InputFlags, :TA_OptInputFlags, or :TA_OutputFlags)
   # @return [Array<Symbol>] Array of flag names that are set in the bitmask
   def extract_flags(value, type)
-    flags_set = []
-    TA_FLAGS[type].each do |k, v|
-      flags_set << k if (value & v) != 0
-    end
-    flags_set
+    TA_FLAGS.fetch(type).filter_map { |name, bit| name if (value & bit) != 0 }
   end
+
+  # The caller owns only the pointer-sized output slot. TA-Lib determines the
+  # lifetime of the address written into it (static metadata, a table or a holder).
+  def native_pointer
+    slot = [0].pack("J")
+    check_ta_return_code(yield(slot))
+    Fiddle::Pointer.new(slot.unpack1("J"))
+  end
+  private_class_method :native_pointer
+
+  def string_table_names(pointer)
+    table = TA_StringTable.new(pointer)
+    return [] if table["size"].zero?
+
+    table["string"].to_s(table["size"] * Fiddle::SIZEOF_VOIDP).unpack("J*").map { |address| Fiddle::Pointer.new(address).to_s }
+  end
+  private_class_method :string_table_names
 
   # Returns a list of all available function groups in TA-Lib
   #
   # @return [Array<String>] Array of group names
   def group_table
-    string_table_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
-    ret_code = TA_GroupTableAlloc(string_table_ptr.ref)
-    check_ta_return_code(ret_code)
-
-    string_table = TA_StringTable.new(string_table_ptr)
-    group_names = Fiddle::Pointer.new(string_table["string"])[0, Fiddle::SIZEOF_VOIDP * string_table["size"]].unpack("Q*").collect { |ptr| Fiddle::Pointer.new(ptr).to_s }
-    TA_GroupTableFree(string_table_ptr)
-
-    group_names
+    table = native_pointer { |slot| TA_GroupTableAlloc(slot) }
+    string_table_names(table)
+  ensure
+    TA_GroupTableFree(table) if table
   end
 
   # Returns a list of all functions in a specific group
@@ -256,16 +270,10 @@ module TALibFFI
   # @param group [String] The name of the group to get functions for
   # @return [Array<String>] Array of function names in the group
   def function_table(group)
-    string_table_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
-    ret_code = TA_FuncTableAlloc(group, string_table_ptr.ref)
-    check_ta_return_code(ret_code)
-
-    string_table = TA_StringTable.new(string_table_ptr)
-    func_names = Fiddle::Pointer.new(string_table["string"])[0, Fiddle::SIZEOF_VOIDP * string_table["size"]].unpack("Q*").collect { |ptr| Fiddle::Pointer.new(ptr).to_s }
-
-    TA_FuncTableFree(string_table)
-
-    func_names
+    table = native_pointer { |slot| TA_FuncTableAlloc(group, slot) }
+    string_table_names(table)
+  ensure
+    TA_FuncTableFree(table) if table
   end
 
   # Gets detailed information about a specific TA-Lib function
@@ -273,15 +281,8 @@ module TALibFFI
   # @param name [String] The name of the function to get information for
   # @return [Fiddle::CStructEntity] Struct containing function information
   def function_info(name)
-    handle_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
-    ret_code = TA_GetFuncHandle(name, handle_ptr.ref)
-    check_ta_return_code(ret_code)
-
-    info_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
-    ret_code = TA_GetFuncInfo(handle_ptr, info_ptr.ref)
-    check_ta_return_code(ret_code)
-
-    TA_FuncInfo.new(info_ptr)
+    handle = get_function_handle(name)
+    TA_FuncInfo.new(native_pointer { |slot| TA_GetFuncInfo(handle, slot) })
   end
 
   # Iterates over all available TA-Lib functions
@@ -308,7 +309,7 @@ module TALibFFI
     puts "Function Name: #{func_info["name"]}"
     puts "Function Group: #{func_info["group"]}"
     puts "Function Hint: #{func_info["hint"]}"
-    puts "Camel Case Name: #{func_info["camelCaseName"]}"
+    puts "Camel Case Name: #{func_info["camelCaseName"]}" if TA_FuncInfo.members.include?("camelCaseName")
     puts "Flags: #{func_info["flags"]}"
     puts "Number of Inputs: #{func_info["nbInput"]}"
     puts "Number of Optional Inputs: #{func_info["nbOptInput"]}"
@@ -316,11 +317,7 @@ module TALibFFI
     puts "Function Handle: #{func_info["handle"].to_i}"
 
     puts "\nInput Parameter Info:"
-    func_info["nbInput"].times do |i|
-      param_info_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
-      ret_code = TA_GetInputParameterInfo(func_info["handle"], i, param_info_ptr.ref)
-      check_ta_return_code(ret_code)
-      param_info = TA_InputParameterInfo.new(param_info_ptr)
+    collect_input_info(func_info).each_with_index do |param_info, i|
       puts "  Parameter #{i + 1}:"
       puts "    Name: #{param_info["paramName"]}"
       puts "    Type: #{param_info["type"]}"
@@ -328,11 +325,7 @@ module TALibFFI
     end
 
     puts "\nOptional Input Parameter Info:"
-    func_info["nbOptInput"].times do |i|
-      param_info_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
-      ret_code = TA_GetOptInputParameterInfo(func_info["handle"], i, param_info_ptr.ref)
-      check_ta_return_code(ret_code)
-      param_info = TA_OptInputParameterInfo.new(param_info_ptr)
+    collect_opt_input_info(func_info).each_with_index do |param_info, i|
       puts "  Parameter #{i + 1}:"
       puts "    Name: #{param_info["paramName"]}"
       puts "    Type: #{param_info["type"]}"
@@ -343,11 +336,7 @@ module TALibFFI
     end
 
     puts "\nOutput Parameter Info:"
-    func_info["nbOutput"].times do |i|
-      param_info_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
-      ret_code = TA_GetOutputParameterInfo(func_info["handle"], i, param_info_ptr.ref)
-      check_ta_return_code(ret_code)
-      param_info = TA_OutputParameterInfo.new(param_info_ptr)
+    collect_output_info(func_info).each_with_index do |param_info, i|
       puts "  Parameter #{i + 1}:"
       puts "    Name: #{param_info["paramName"]}"
       puts "    Type: #{param_info["type"]}"
@@ -361,64 +350,97 @@ module TALibFFI
   # @param args [Array] Array of input arrays and optional parameters
   # @return [Array, Hash] Function results (single array or hash of named outputs)
   # @raise [TALibError] If there is an error in function execution
-  def call_func(func_name, args) # rubocop:disable Metrics/MethodLength
-    options = args.last.is_a?(Hash) ? args.pop : {}
-    input_arrays = args
-
-    validate_inputs!(input_arrays)
-
-    handle_ptr = get_function_handle(func_name)
-    params_ptr = create_parameter_holder(handle_ptr)
-
-    begin
-      setup_input_parameters(params_ptr, input_arrays, func_name)
-      setup_optional_parameters(params_ptr, options, func_name)
-      _lookback = calculate_lookback(params_ptr)
-      calculate_results(params_ptr, input_arrays, func_name)
-    ensure
-      TA_ParamHolderFree(params_ptr)
-    end
+  def call_func(func_name, args)
+    info = function_info_map.fetch(func_name) { raise TALibError, "Unknown TA-Lib function #{func_name.inspect}" }
+    inputs, options = args.last.is_a?(Hash) ? [args[0...-1], args.last] : [args, {}]
+    size = validate_inputs!(inputs, func_name)
+    validate_options!(func_name, options, info[:keywords])
+    run_indicator(info[:handle], func_name, inputs, options, size)
   end
+
+  def run_indicator(handle, name, inputs, options, size)
+    params = create_parameter_holder(handle)
+    setup_input_parameters(params, inputs, name, size: size)
+    setup_optional_parameters(params, options, name)
+    calculate_results(params, inputs, name, input_size: size)
+  rescue TALibError, TypeError, RangeError => e
+    arguments = options.map { |key, value| "#{key}=#{value.inspect}" }.join(", ")
+    raise TALibError, "#{name}(#{arguments}): #{e.message}"
+  ensure
+    TA_ParamHolderFree(params) if params
+  end
+  private_class_method :run_indicator
 
   # Calculates the lookback period for a function with given parameters
   #
   # @param params_ptr [Fiddle::Pointer] Pointer to parameter holder
   # @return [Integer] The lookback period
   def calculate_lookback(params_ptr)
-    lookback_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_INT)
-    ret_code = TA_GetLookback(params_ptr, lookback_ptr)
-    check_ta_return_code(ret_code)
-    lookback_ptr[0, Fiddle::SIZEOF_INT].unpack1("l")
+    lookback = [0].pack("i!")
+    check_ta_return_code(TA_GetLookback(params_ptr, lookback))
+    lookback.unpack1("i!")
   end
 
   # Validates input arrays for TA-Lib functions
   #
   # @param arrays [Array<Array>] Arrays to validate
   # @raise [TALibError] If any array is invalid
-  def validate_inputs!(arrays) # rubocop:disable Metrics/CyclomaticComplexity,Metrics/PerceivedComplexity
-    raise TALibError, "Input arrays cannot be empty" if arrays.empty?
+  def validate_inputs!(arrays, func_name = nil)
+    series = if func_name
+               input_series(func_name, arrays)
+             else
+               arrays.flat_map { |arg| arg.is_a?(Array) && arg.first.is_a?(Array) ? arg : [arg] }
+             end
+    series_length!(series, func_name)
+  end
 
-    arrays.each do |arr|
-      raise TALibError, "Input must be arrays" unless arr.is_a?(Array)
-    end
+  def series_length!(series, func_name)
+    raise TALibError, "Expected input arrays" unless series.all?(Array)
 
-    sizes = arrays.map(&:length)
-    raise TALibError, "Input arrays cannot be empty" if sizes.any?(&:zero?)
+    lengths = series.map(&:length).uniq
+    raise TALibError, "Input arrays cannot be empty" unless lengths.fetch(0, 0).positive?
+    raise TALibError, "#{func_name} input series must have equal lengths (got #{lengths.join(", ")})" unless lengths.one?
+    raise TALibError, "Input arrays must contain only numbers" unless series.all? { |values| values.all?(Numeric) }
 
-    arrays.each do |arr|
-      raise TALibError, "Input arrays must contain only numbers" unless arr.flatten.all? { |x| x.is_a?(Numeric) }
+    lengths.first
+  end
+  private_class_method :series_length!
+
+  def input_series(name, args)
+    layout = function_info_map.fetch(name)[:input_names]
+    input_shape_error!(name, layout) unless layout.size == args.size
+    args.zip(layout).flat_map do |arg, fields|
+      next [arg] unless fields.is_a?(Array)
+
+      input_shape_error!(name, layout) unless arg.is_a?(Array) && arg.size == fields.size && arg.all?(Array)
+      arg
     end
   end
+  private_class_method :input_series
+
+  def input_shape_error!(name, layout)
+    args = layout.map { |input| input.is_a?(Array) ? "[#{input.join(", ")}]" : input }
+    raise TALibError, "Expected TALibFFI.#{name.downcase}(#{args.join(", ")}) with optional parameters passed by keyword"
+  end
+  private_class_method :input_shape_error!
+
+  def validate_options!(name, options, keywords)
+    options.each do |key, value|
+      unless keywords.key?(key)
+        allowed = keywords.empty? ? "no keywords accepted" : "available keywords: #{keywords.keys.join(", ")}"
+        raise TALibError, "#{name} unknown keyword #{key.inspect} (#{allowed})"
+      end
+      raise TALibError, "#{name} keyword #{key.inspect} requires a number" unless value.is_a?(Numeric)
+    end
+  end
+  private_class_method :validate_options!
 
   # Gets a function handle for a given function name
   #
   # @param func_name [String] The name of the function
   # @return [Fiddle::Pointer] Pointer to function handle
   def get_function_handle(func_name)
-    handle_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
-    ret_code = TA_GetFuncHandle(func_name, handle_ptr.ref)
-    check_ta_return_code(ret_code)
-    handle_ptr
+    native_pointer { |slot| TA_GetFuncHandle(func_name, slot) }
   end
 
   # Creates a parameter holder for a function
@@ -426,10 +448,7 @@ module TALibFFI
   # @param handle_ptr [Fiddle::Pointer] Function handle pointer
   # @return [Fiddle::Pointer] Pointer to parameter holder
   def create_parameter_holder(handle_ptr)
-    params_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
-    ret_code = TA_ParamHolderAlloc(handle_ptr, params_ptr.ref)
-    check_ta_return_code(ret_code)
-    params_ptr
+    native_pointer { |slot| TA_ParamHolderAlloc(handle_ptr, slot) }
   end
 
   # Sets up input parameters for a function call
@@ -437,11 +456,11 @@ module TALibFFI
   # @param params_ptr [Fiddle::Pointer] Parameter holder pointer
   # @param input_arrays [Array<Array>] Input data arrays
   # @param func_name [String] Function name
-  def setup_input_parameters(params_ptr, input_arrays, func_name)
+  def setup_input_parameters(params_ptr, input_arrays, func_name, size: nil)
     func_info = function_info_map[func_name]
     input_arrays.each_with_index do |array, index|
       input_info = func_info[:inputs][index]
-      ret_code = set_input_parameter(params_ptr, index, array, input_info)
+      ret_code = set_input_parameter(params_ptr, index, array, input_info, size: size)
       check_ta_return_code(ret_code)
     end
   end
@@ -453,42 +472,53 @@ module TALibFFI
   # @param array [Array] Input data array
   # @param input_info [Hash] Input parameter information
   # @return [Integer] TA-Lib return code
-  def set_input_parameter(params_ptr, index, array, input_info)
+  def set_input_parameter(params_ptr, index, array, input_info, size: nil)
     case input_info["type"]
     when TA_PARAM_TYPE[:TA_Input_Real]
-      input_ptr = prepare_double_array(array)
-      TA_SetInputParamRealPtr(params_ptr, index, input_ptr)
+      bind_input(params_ptr, index, prepare_double_array(array, size: size)) { |ptr| TA_SetInputParamRealPtr(params_ptr, index, ptr) }
     when TA_PARAM_TYPE[:TA_Input_Integer]
-      input_ptr = prepare_integer_array(array)
-      TA_SetInputParamIntegerPtr(params_ptr, index, input_ptr)
+      bind_input(params_ptr, index, prepare_integer_array(array, size: size)) { |ptr| TA_SetInputParamIntegerPtr(params_ptr, index, ptr) }
     when TA_PARAM_TYPE[:TA_Input_Price]
-      setup_price_inputs(params_ptr, index, array, input_info["flags"])
+      setup_price_inputs(params_ptr, index, array, input_info["flags"], size: size)
     end
   end
+
+  # TA-Lib borrows these pointers until TA_CallFunc returns. Keep the pointers
+  # (and the packed Ruby strings they pin) alive on this particular holder.
+  def bind_input(holder, index, buffer)
+    status = yield(buffer)
+    if status == TA_SUCCESS
+      inputs = holder.instance_variable_get(:@ta_input_buffers) || holder.instance_variable_set(:@ta_input_buffers, [])
+      inputs[index] = buffer
+    end
+    status
+  end
+  private_class_method :bind_input
 
   # Prepares a double array for TA-Lib input
   #
   # @param array [Array<Numeric>] Array of numbers to prepare
   # @return [Fiddle::Pointer] Pointer to prepared array
-  def prepare_double_array(array)
-    array_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_DOUBLE * array.length)
-    array.each_with_index do |value, i|
-      array_ptr[i * Fiddle::SIZEOF_DOUBLE, Fiddle::SIZEOF_DOUBLE] = [value.to_f].pack("d")
-    end
-    array_ptr
+  def prepare_double_array(array, size: nil)
+    packed_input(array.pack("d*"), Fiddle::SIZEOF_DOUBLE, size)
   end
 
   # Prepares an integer array for TA-Lib input
   #
   # @param array [Array<Numeric>] Array of numbers to prepare
   # @return [Fiddle::Pointer] Pointer to prepared array
-  def prepare_integer_array(array)
-    array_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_INT * array.length)
-    array.each_with_index do |value, i|
-      array_ptr[i * Fiddle::SIZEOF_INT, Fiddle::SIZEOF_INT] = [value.to_i].pack("l")
-    end
-    array_ptr
+  def prepare_integer_array(array, size: nil)
+    packed_input(array.pack("i!*"), Fiddle::SIZEOF_INT, size)
   end
+
+  # Check the actual snapshot too. Other Ruby threads can change an input
+  # array between validation and packing while Fiddle releases the GVL.
+  def packed_input(bytes, width, size)
+    raise TALibError, "Input length changed during calculation" if size && bytes.bytesize != size * width
+
+    Fiddle::Pointer[bytes]
+  end
+  private_class_method :packed_input
 
   # Sets up optional parameters for a function call
   #
@@ -496,10 +526,10 @@ module TALibFFI
   # @param options [Hash] Optional parameters
   # @param func_name [String] Function name
   def setup_optional_parameters(params_ptr, options, func_name)
-    func_info = function_info_map[func_name]
-    func_info[:opt_inputs]&.each_with_index do |opt_input, index|
-      param_name = normalize_parameter_name(opt_input["paramName"].to_s)
-      set_optional_parameter(params_ptr, index, options[param_name.to_sym], opt_input["type"]) if options.key?(param_name.to_sym)
+    keywords = function_info_map.fetch(func_name)[:keywords]
+    options.each do |name, value|
+      index, type = keywords.fetch(name)
+      set_optional_parameter(params_ptr, index, value, type)
     end
   end
 
@@ -525,29 +555,15 @@ module TALibFFI
   # @param input_arrays [Array] Input data
   # @param func_name [String] Function name
   # @return [Array, Hash] Function results
-  def calculate_results(params_ptr, input_arrays, func_name) # rubocop:disable Metrics/MethodLength,Metrics/AbcSize
-    func_info = function_info_map[func_name]
-    input_size = if func_info[:inputs].first["type"] == TA_PARAM_TYPE[:TA_Input_Price]
-                   input_arrays[0][0].length
-                 else
-                   input_arrays[0].length
-                 end
+  def calculate_results(params_ptr, input_arrays, func_name, input_size: validate_inputs!(input_arrays, func_name))
+    out_begin = [0].pack("i!")
+    out_size = [0].pack("i!")
+    buffers = setup_output_buffers(params_ptr, input_size, func_name)
+    check_ta_return_code(TA_CallFunc(params_ptr, 0, input_size - 1, out_begin, out_size))
+    count = out_size.unpack1("i!")
+    raise TALibError, "Invalid output count #{count} for #{func_name}" unless count.between?(0, input_size)
 
-    out_begin = Fiddle::Pointer.malloc(Fiddle::SIZEOF_INT)
-    out_size = Fiddle::Pointer.malloc(Fiddle::SIZEOF_INT)
-    output_arrays = setup_output_buffers(params_ptr, input_size, func_name)
-
-    begin
-      ret_code = TA_CallFunc(params_ptr, 0, input_size - 1, out_begin, out_size)
-      check_ta_return_code(ret_code)
-
-      actual_size = out_size[0, Fiddle::SIZEOF_INT].unpack1("l")
-      format_output_results(output_arrays, actual_size, func_name)
-    ensure
-      out_begin.free
-      out_size.free
-      output_arrays.each(&:free)
-    end
+    format_output_results(buffers, count, func_name)
   end
 
   # Sets up output buffers for function results
@@ -556,31 +572,12 @@ module TALibFFI
   # @param size [Integer] Size of output buffer
   # @param func_name [String] Function name
   # @return [Array<Fiddle::Pointer>] Array of output buffer pointers
-  def setup_output_buffers(params_ptr, size, func_name) # rubocop:disable Metrics/MethodLength,Metrics/AbcSize
-    func_info = function_info_map[func_name]
-    output_ptrs = []
-
-    func_info[:outputs].each_with_index do |output, index|
-      ptr = case output["type"]
-            when TA_PARAM_TYPE[:TA_Output_Real]
-              Fiddle::Pointer.malloc(Fiddle::SIZEOF_DOUBLE * size)
-            when TA_PARAM_TYPE[:TA_Output_Integer]
-              Fiddle::Pointer.malloc(Fiddle::SIZEOF_INT * size)
-            end
-
-      output_ptrs << ptr
-
-      ret_code =  case output["type"]
-                  when TA_PARAM_TYPE[:TA_Output_Real]
-                    TA_SetOutputParamRealPtr(params_ptr, index, ptr)
-                  when TA_PARAM_TYPE[:TA_Output_Integer]
-                    TA_SetOutputParamIntegerPtr(params_ptr, index, ptr)
-                  end
-
-      check_ta_return_code(ret_code)
+  def setup_output_buffers(params_ptr, size, func_name)
+    function_info_map.fetch(func_name)[:output_layout].map.with_index do |(_format, width, setter), index|
+      ptr = Fiddle::Pointer["\0".b * (size * width)]
+      check_ta_return_code(public_send(setter, params_ptr, index, ptr))
+      ptr
     end
-
-    output_ptrs
   end
 
   # Formats output results from TA-Lib function
@@ -589,23 +586,12 @@ module TALibFFI
   # @param size [Integer] Size of output data
   # @param func_name [String] Function name
   # @return [Array, Hash] Formatted results
-  def format_output_results(output_ptrs, size, func_name) # rubocop:disable Metrics/AbcSize,Metrics/MethodLength
-    func_info = function_info_map[func_name]
-    results = output_ptrs.zip(func_info[:outputs]).map do |ptr, output|
-      case output["type"]
-      when TA_PARAM_TYPE[:TA_Output_Real]
-        ptr[0, Fiddle::SIZEOF_DOUBLE * size].unpack("d#{size}")
-      when TA_PARAM_TYPE[:TA_Output_Integer]
-        ptr[0, Fiddle::SIZEOF_INT * size].unpack("l#{size}")
-      end
+  def format_output_results(output_ptrs, size, func_name)
+    info = function_info_map.fetch(func_name)
+    results = output_ptrs.zip(info[:output_layout]).map do |ptr, (format, width, _)|
+      ptr.to_s(size * width).unpack("#{format}*")
     end
-
-    return results.first if results.length == 1
-
-    output_names = func_info[:outputs].map do |output|
-      normalize_parameter_name(output["paramName"].to_s).to_sym
-    end
-    output_names.zip(results).to_h
+    results.one? ? results.first : info[:output_names].zip(results).to_h
   end
 
   # Gets XML description of all TA-Lib functions
@@ -628,25 +614,56 @@ module TALibFFI
   def build_function_info_map
     info_map = {}
     each_function do |func_info|
-      info_map[func_info["name"].to_s] = {
-        info: func_info,
-        inputs: collect_input_info(func_info),
-        outputs: collect_output_info(func_info),
-        opt_inputs: collect_opt_input_info(func_info)
-      }
+      info_map[func_info["name"].to_s] = function_parameters(func_info)
     end
     info_map
   end
+
+  def function_parameters(info)
+    inputs = collect_input_info(info)
+    options = collect_opt_input_info(info)
+    outputs = collect_output_info(info)
+    {
+      info: info, handle: info["handle"], inputs: inputs, opt_inputs: options, outputs: outputs,
+      input_names: inputs.map { |input| input_name(input) },
+      keywords: keyword_index(options),
+      output_layout: outputs.map { |output| OUTPUT_LAYOUTS.fetch(output["type"]) },
+      output_names: outputs.map { |output| parameter_key(output) }
+    }
+  end
+  private_class_method :function_parameters
+
+  def keyword_index(options)
+    options.each_with_index.to_h { |option, index| [parameter_key(option), [index, option["type"]]] }
+  end
+  private_class_method :keyword_index
+
+  def parameter_key(parameter)
+    normalize_parameter_name(parameter["paramName"].to_s).to_sym
+  end
+  private_class_method :parameter_key
+  def input_name(input)
+    return normalize_parameter_name(input["paramName"].to_s) unless input["type"] == TA_PARAM_TYPE[:TA_Input_Price]
+
+    PRICE_FIELDS.values_at(*price_indexes(input["flags"]))
+  end
+  private_class_method :input_name
+
+  def price_indexes(flags)
+    raise TALibError, "Unsupported TA-Lib price flags #{flags}" unless (flags >> PRICE_FIELDS.size).zero?
+
+    PRICE_FIELDS.each_index.select { |i| flags.anybits?(1 << i) }
+  end
+  private_class_method :price_indexes
 
   # Collects input parameter information for a function
   #
   # @param func_info [Fiddle::CStructEntity] Function information
   # @return [Array<Fiddle::CStructEntity>] Array of input parameter information
   def collect_input_info(func_info)
-    func_info["nbInput"].times.map do |i|
-      param_info_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
-      TA_GetInputParameterInfo(func_info["handle"], i, param_info_ptr.ref)
-      TA_InputParameterInfo.new(param_info_ptr)
+    handle = func_info["handle"]
+    func_info["nbInput"].times.map do |index|
+      TA_InputParameterInfo.new(native_pointer { |slot| TA_GetInputParameterInfo(handle, index, slot) })
     end
   end
 
@@ -655,10 +672,9 @@ module TALibFFI
   # @param func_info [Fiddle::CStructEntity] Function information
   # @return [Array<Fiddle::CStructEntity>] Array of optional input parameter information
   def collect_opt_input_info(func_info)
-    func_info["nbOptInput"].times.map do |i|
-      param_info_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
-      TA_GetOptInputParameterInfo(func_info["handle"], i, param_info_ptr.ref)
-      TA_OptInputParameterInfo.new(param_info_ptr)
+    handle = func_info["handle"]
+    func_info["nbOptInput"].times.map do |index|
+      TA_OptInputParameterInfo.new(native_pointer { |slot| TA_GetOptInputParameterInfo(handle, index, slot) })
     end
   end
 
@@ -667,10 +683,9 @@ module TALibFFI
   # @param func_info [Fiddle::CStructEntity] Function information
   # @return [Array<Fiddle::CStructEntity>] Array of output parameter information
   def collect_output_info(func_info)
-    func_info["nbOutput"].times.map do |i|
-      param_info_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
-      TA_GetOutputParameterInfo(func_info["handle"], i, param_info_ptr.ref)
-      TA_OutputParameterInfo.new(param_info_ptr)
+    handle = func_info["handle"]
+    func_info["nbOutput"].times.map do |index|
+      TA_OutputParameterInfo.new(native_pointer { |slot| TA_GetOutputParameterInfo(handle, index, slot) })
     end
   end
 
@@ -679,9 +694,7 @@ module TALibFFI
   # This method iterates through all available TA-Lib functions and creates
   # corresponding Ruby methods with proper documentation.
   def generate_ta_functions
-    each_function do |func_info|
-      define_ta_function(func_info["name"].to_s.downcase, func_info["name"].to_s)
-    end
+    function_info_map.each_key { |name| define_ta_function(name.downcase, name) }
   end
 
   # Normalizes parameter names to Ruby style
@@ -774,30 +787,35 @@ module TALibFFI
   # @param index [Integer] Parameter index
   # @param price_data [Array] Price data array
   # @param flags [Integer] Input flags
-  def setup_price_inputs(params_ptr, index, price_data, flags)
-    required_flags = extract_flags(flags, :TA_InputFlags)
-    data_pointers = Array.new(6) { Fiddle::Pointer.malloc(0) }
-    required_flags.each_with_index do |flag, i|
-      flag_index = TA_FLAGS[:TA_InputFlags].keys.index(flag)
-      data_pointers[flag_index] = prepare_double_array(price_data[i]) if required_flags.include?(flag)
-    end
-
-    TA_SetInputParamPricePtr(params_ptr, index, *data_pointers)
+  def setup_price_inputs(params_ptr, index, price_data, flags, size: nil)
+    pointers = Array.new(PRICE_FIELDS.size)
+    price_indexes(flags).zip(price_data) { |slot, series| pointers[slot] = prepare_double_array(series, size: size) }
+    bind_input(params_ptr, index, pointers) { |prices| TA_SetInputParamPricePtr(params_ptr, index, *prices) }
   end
 
   initialize_ta_lib
   generate_ta_functions
 
   # Placeholder for generated TA-Lib function documentation.
-  # Generated using YARD.
+  # Available functions and their defaults depend on the installed C library.
   # Run: rake yard
   class << self
     ### GENERATED DOCUMENTATION START ###
+    # @!method ac(price_hl, fast_period: 5.0, slow_period: 34.0, signal_period: 5.0)
+    # Accelerator/Decelerator Oscillator
+    #
+    # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
+    # @param fast_period [Integer]  Period of the fast MA (default: 5.0)
+    # @param slow_period [Integer]  Period of the slow MA (default: 34.0)
+    # @param signal_period [Integer]  Smoothing for the signal line (period length) (default: 5.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
     # @!method accbands(price_hlc, time_period: 20.0)
     # Acceleration Bands
     #
     # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
-    # @param time_period [Integer]  Number of period (default: 20.0)
+    # @param time_period [Integer]  Time period (default: 20.0)
     # @return [Hash]  Hash containing the following arrays:
     # @option result [Array<Float>] :upper_band  Output values
     # @option result [Array<Float>] :middle_band  Output values
@@ -830,8 +848,16 @@ module TALibFFI
     # Chaikin A/D Oscillator
     #
     # @param price_hlcv [Array(Array<Float>, Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close, volume
-    # @param fast_period [Integer]  Number of period for the fast MA (default: 3.0)
-    # @param slow_period [Integer]  Number of period for the slow MA (default: 10.0)
+    # @param fast_period [Integer]  Period of the fast MA (default: 3.0)
+    # @param slow_period [Integer]  Period of the slow MA (default: 10.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method adr(price_hl, time_period: 14.0)
+    # Average Day Range
+    #
+    # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -839,7 +865,7 @@ module TALibFFI
     # Average Directional Movement Index
     #
     # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -847,17 +873,36 @@ module TALibFFI
     # Average Directional Movement Index Rating
     #
     # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
-    # @!method apo(real, fast_period: 12.0, slow_period: 26.0, ma_type: 0.0)
+    # @!method alma(real, time_period: 9.0, sigma: 6.0, offset: 0.85)
+    # Arnaud Legoux Moving Average
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 9.0)
+    # @param sigma [Float]  Gaussian width divisor (default: 6.0)
+    # @param offset [Float]  Position of the peak weight (default: 0.85)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method ao(price_hl, fast_period: 5.0, slow_period: 34.0)
+    # Awesome Oscillator
+    #
+    # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
+    # @param fast_period [Integer]  Period of the fast MA (default: 5.0)
+    # @param slow_period [Integer]  Period of the slow MA (default: 34.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method apo(real, fast_period: 12.0, slow_period: 26.0, ma_type: 1.0)
     # Absolute Price Oscillator
     #
     # @param real [Array<Float>]  Input values
-    # @param fast_period [Integer]  Number of period for the fast MA (default: 12.0)
-    # @param slow_period [Integer]  Number of period for the slow MA (default: 26.0)
-    # @param ma_type [Integer]  Type of Moving Average (default: 0.0)
+    # @param fast_period [Integer]  Period of the fast MA (default: 12.0)
+    # @param slow_period [Integer]  Period of the slow MA (default: 26.0)
+    # @param ma_type [Integer]  Type of Moving Average (default: 1.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -865,7 +910,7 @@ module TALibFFI
     # Aroon
     #
     # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Hash]  Hash containing the following arrays:
     # @option result [Array<Float>] :aroon_down  Output values
     # @option result [Array<Float>] :aroon_up  Output values
@@ -875,7 +920,15 @@ module TALibFFI
     # Aroon Oscillator
     #
     # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method asi(price_ohlc, limit_move: 3.0)
+    # Wilder Accumulative Swing Index
+    #
+    # @param price_ohlc [Array(Array<Float>, Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: open, high, low, close
+    # @param limit_move [Float]  Largest one-bar price move the index is scaled against, in price units (default: 3.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -897,7 +950,15 @@ module TALibFFI
     # Average True Range
     #
     # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method avgdev(real, time_period: 14.0)
+    # Average Deviation
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -908,19 +969,11 @@ module TALibFFI
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
-    # @!method avgdev(real, time_period: 14.0)
-    # Average Deviation
-    #
-    # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 14.0)
-    # @return [Array<Float>]
-    # @raise [TALibError]  If there is an error in function execution
-
-    # @!method bbands(real, time_period: 5.0, nb_dev_up: 2.0, nb_dev_dn: 2.0, ma_type: 0.0)
+    # @!method bbands(real, time_period: 20.0, nb_dev_up: 2.0, nb_dev_dn: 2.0, ma_type: 0.0)
     # Bollinger Bands
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 5.0)
+    # @param time_period [Integer]  Time period (default: 20.0)
     # @param nb_dev_up [Float]  Deviation multiplier for upper band (default: 2.0)
     # @param nb_dev_dn [Float]  Deviation multiplier for lower band (default: 2.0)
     # @param ma_type [Integer]  Type of Moving Average (default: 0.0)
@@ -930,12 +983,23 @@ module TALibFFI
     # @option result [Array<Float>] :lower_band  Output values
     # @raise [TALibError]  If there is an error in function execution
 
+    # @!method bbw(real, time_period: 20.0, nb_dev_up: 2.0, nb_dev_dn: 2.0, ma_type: 0.0)
+    # Bollinger BandWidth
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 20.0)
+    # @param nb_dev_up [Float]  Deviation multiplier for upper band (default: 2.0)
+    # @param nb_dev_dn [Float]  Deviation multiplier for lower band (default: 2.0)
+    # @param ma_type [Integer]  Type of Moving Average (default: 0.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
     # @!method beta(real0, real1, time_period: 5.0)
     # Beta
     #
     # @param real0 [Array<Float>]  Input values
     # @param real1 [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 5.0)
+    # @param time_period [Integer]  Time period (default: 5.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -950,7 +1014,7 @@ module TALibFFI
     # Commodity Channel Index
     #
     # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1395,11 +1459,73 @@ module TALibFFI
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
+    # @!method cg(real, time_period: 10.0)
+    # Center of Gravity Oscillator
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Number of bars in the window (default: 10.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method chop(price_hlc, time_period: 14.0)
+    # Choppiness Index
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @param time_period [Integer]  Time period (default: 14.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method choptr(price_hlc, time_period: 14.0)
+    # Choppiness Index (True Range Box)
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @param time_period [Integer]  Time period (default: 14.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method cksp(price_hlc, time_period: 10.0, multiplier: 1.0, stop_period: 9.0)
+    # Chande Kroll Stop
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @param time_period [Integer]  ATR and extreme window (default: 10.0)
+    # @param multiplier [Float]  ATR multiplier (default: 1.0)
+    # @param stop_period [Integer]  Stop window (default: 9.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :high_stop  Output values
+    # @option result [Array<Float>] :low_stop  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method cmf(price_hlcv, time_period: 20.0)
+    # Chaikin Money Flow
+    #
+    # @param price_hlcv [Array(Array<Float>, Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close, volume
+    # @param time_period [Integer]  Time period (default: 20.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
     # @!method cmo(real, time_period: 14.0)
     # Chande Momentum Oscillator
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method cmou(real, time_period: 14.0)
+    # Chande Momentum Oscillator (Unsmoothed)
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 14.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method coppock(real, wma_period: 10.0, roc1_period: 11.0, roc2_period: 14.0)
+    # Coppock Curve
+    #
+    # @param real [Array<Float>]  Input values
+    # @param wma_period [Integer]  Smoothing period for the ROC sum (default: 10.0)
+    # @param roc1_period [Integer]  Short rate-of-change period (default: 11.0)
+    # @param roc2_period [Integer]  Long rate-of-change period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1408,7 +1534,7 @@ module TALibFFI
     #
     # @param real0 [Array<Float>]  Input values
     # @param real1 [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1426,11 +1552,45 @@ module TALibFFI
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
+    # @!method crsi(real, time_period: 3.0, streak_period: 2.0, rank_period: 100.0)
+    # Connors Relative Strength Index
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 3.0)
+    # @param streak_period [Integer]  Time period of the RSI of the up/down streak (default: 2.0)
+    # @param rank_period [Integer]  Number of previous one-bar returns the current one is ranked against (default: 100.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method cti(real, time_period: 20.0)
+    # Correlation Trend Indicator
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Number of bars correlated against the ramp (default: 20.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method cumsum(real)
+    # Cumulative Sum
+    #
+    # @param real [Array<Float>]  Input values
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method cvi(price_hl, time_period: 10.0, roc_period: 10.0)
+    # Chaikin's Volatility
+    #
+    # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
+    # @param time_period [Integer]  Period of the EMA smoothing the high-low spread (default: 10.0)
+    # @param roc_period [Integer]  Number of bars the rate of change reaches back (default: 10.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
     # @!method dema(real, time_period: 30.0)
     # Double Exponential Moving Average
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1442,11 +1602,49 @@ module TALibFFI
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
+    # @!method donchian(price_hl, time_period: 20.0)
+    # Donchian Channels
+    #
+    # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
+    # @param time_period [Integer]  Time period (default: 20.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :upper_band  Output values
+    # @option result [Array<Float>] :middle_band  Output values
+    # @option result [Array<Float>] :lower_band  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method dosc(real, time_period: 14.0, first_period: 5.0, second_period: 3.0, signal_period: 9.0)
+    # Derivative Oscillator
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Period of the RSI (default: 14.0)
+    # @param first_period [Integer]  Period of the first smoothing, applied to the RSI (default: 5.0)
+    # @param second_period [Integer]  Period of the second smoothing, applied to the first (default: 3.0)
+    # @param signal_period [Integer]  Period of the simple average subtracted from the smoothed line (default: 9.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method dpo(real, time_period: 20.0)
+    # Detrended Price Oscillator
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 20.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
     # @!method dx(price_hlc, time_period: 14.0)
     # Directional Movement Index
     #
     # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method efi(price_cv, time_period: 13.0)
+    # Elder's Force Index
+    #
+    # @param price_cv [Array(Array<Float>, Array<Float>)]  Required price arrays: close, volume
+    # @param time_period [Integer]  Time period (default: 13.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1454,8 +1652,35 @@ module TALibFFI
     # Exponential Moving Average
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method emv(price_hlv, time_period: 14.0, volume_divisor: 10000.0)
+    # Arms Ease of Movement
+    #
+    # @param price_hlv [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, volume
+    # @param time_period [Integer]  Bars in the SMA of the one-bar values (1 = unsmoothed) (default: 14.0)
+    # @param volume_divisor [Float]  Volume is divided by this before forming the box ratio (default: 10000.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method er(real, time_period: 10.0)
+    # Kaufman Efficiency Ratio
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Number of one-bar changes in the path sum (default: 10.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method eri(price_hlc, time_period: 13.0)
+    # Elder Ray Index (Bull Power / Bear Power)
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @param time_period [Integer]  Number of bars in the EMA of close (default: 13.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :bull_power  Output values
+    # @option result [Array<Float>] :bear_power  Output values
     # @raise [TALibError]  If there is an error in function execution
 
     # @!method exp(real)
@@ -1465,10 +1690,66 @@ module TALibFFI
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
+    # @!method fisher(price_hl, time_period: 10.0)
+    # Fisher Transform
+    #
+    # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
+    # @param time_period [Integer]  Time period (default: 10.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :fisher  Output values
+    # @option result [Array<Float>] :trigger  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
     # @!method floor(real)
     # Vector Floor
     #
     # @param real [Array<Float>]  Input values
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method fosc(real, time_period: 5.0)
+    # Forecast Oscillator
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 5.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method fractal(price_hl, left_bars: 2.0, right_bars: 2.0)
+    # Williams Fractal
+    #
+    # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
+    # @param left_bars [Integer]  Number of bars required to be lower/higher before the pivot (default: 2.0)
+    # @param right_bars [Integer]  Number of bars required to be lower/higher after the pivot (default: 2.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Integer>] :swing_high  Output values
+    # @option result [Array<Integer>] :swing_low  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method frama(price_hl, time_period: 16.0)
+    # Fractal Adaptive Moving Average
+    #
+    # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
+    # @param time_period [Integer]  Number of bars, even; the window is split into two halves of optInTimePeriod/2 bars (default: 16.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method ha(price_ohlc)
+    # Heikin-Ashi Candles
+    #
+    # @param price_ohlc [Array(Array<Float>, Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: open, high, low, close
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :ha_open  Output values
+    # @option result [Array<Float>] :ha_high  Output values
+    # @option result [Array<Float>] :ha_low  Output values
+    # @option result [Array<Float>] :ha_close  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method hma(real, time_period: 20.0)
+    # Hull Moving Average
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 20.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1518,11 +1799,32 @@ module TALibFFI
     # @return [Array<Integer>]
     # @raise [TALibError]  If there is an error in function execution
 
+    # @!method ibs(price_hlc)
+    # Internal Bar Strength
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method ichimoku(price_hl, tenkan_period: 9.0, kijun_period: 26.0, senkou_b_period: 52.0)
+    # Ichimoku Kinko Hyo
+    #
+    # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
+    # @param tenkan_period [Integer]  Period of the conversion line (default: 9.0)
+    # @param kijun_period [Integer]  Period of the base line, and the forward shift of the two spans (default: 26.0)
+    # @param senkou_b_period [Integer]  Period of the second leading span (default: 52.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :tenkan_sen  Output values
+    # @option result [Array<Float>] :kijun_sen  Output values
+    # @option result [Array<Float>] :senkou_span_a  Output values
+    # @option result [Array<Float>] :senkou_span_b  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
     # @!method imi(price_oc, time_period: 14.0)
     # Intraday Momentum Index
     #
     # @param price_oc [Array(Array<Float>, Array<Float>)]  Required price arrays: open, close
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1530,15 +1832,101 @@ module TALibFFI
     # Kaufman Adaptive Moving Average
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method kc(price_hlc, time_period: 20.0, atr_period: 10.0, nb_dev: 2.0)
+    # Keltner Channels
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @param time_period [Integer]  Time period for the typical price moving average (default: 20.0)
+    # @param atr_period [Integer]  Time period for the Average True Range (default: 10.0)
+    # @param nb_dev [Float]  Multiplier applied to the Average True Range (default: 2.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :upper_band  Output values
+    # @option result [Array<Float>] :middle_band  Output values
+    # @option result [Array<Float>] :lower_band  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method kdj(price_hlc, fast_k_period: 9.0, slow_k_period: 3.0, slow_k_ma_type: 13.0, slow_d_period: 3.0, slow_d_ma_type: 13.0)
+    # KDJ Stochastic
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @param fast_k_period [Integer]  Time period for building the Fast-K line (default: 9.0)
+    # @param slow_k_period [Integer]  Smoothing for making the Slow-K line. Usually set to 3 (default: 3.0)
+    # @param slow_k_ma_type [Integer]  Type of Moving Average for Slow-K (default: 13.0)
+    # @param slow_d_period [Integer]  Smoothing for making the Slow-D line (default: 3.0)
+    # @param slow_d_ma_type [Integer]  Type of Moving Average for Slow-D (default: 13.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :k  Output values
+    # @option result [Array<Float>] :d  Output values
+    # @option result [Array<Float>] :j  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method kst(real, roc1_period: 10.0, roc2_period: 15.0, roc3_period: 20.0, roc4_period: 30.0, sma1_period: 10.0, sma2_period: 10.0, sma3_period: 10.0, sma4_period: 15.0, signal_period: 9.0)
+    # Know Sure Thing (Pring)
+    #
+    # @param real [Array<Float>]  Input values
+    # @param roc1_period [Integer]  Rate-of-change period of leg 1 (default: 10.0)
+    # @param roc2_period [Integer]  Rate-of-change period of leg 2 (default: 15.0)
+    # @param roc3_period [Integer]  Rate-of-change period of leg 3 (default: 20.0)
+    # @param roc4_period [Integer]  Rate-of-change period of leg 4 (default: 30.0)
+    # @param sma1_period [Integer]  Smoothing period of leg 1 (default: 10.0)
+    # @param sma2_period [Integer]  Smoothing period of leg 2 (default: 10.0)
+    # @param sma3_period [Integer]  Smoothing period of leg 3 (default: 10.0)
+    # @param sma4_period [Integer]  Smoothing period of leg 4 (default: 15.0)
+    # @param signal_period [Integer]  Smoothing period of the signal line (default: 9.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :kst  Output values
+    # @option result [Array<Float>] :kst_signal  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method kstext(real, roc1_period: 10.0, roc2_period: 15.0, roc3_period: 20.0, roc4_period: 30.0, ma1_period: 10.0, ma2_period: 10.0, ma3_period: 10.0, ma4_period: 15.0, signal_period: 9.0, rocma_type: 0.0, signal_ma_type: 0.0)
+    # Know Sure Thing with controllable MA type
+    #
+    # @param real [Array<Float>]  Input values
+    # @param roc1_period [Integer]  Rate-of-change period of leg 1 (default: 10.0)
+    # @param roc2_period [Integer]  Rate-of-change period of leg 2 (default: 15.0)
+    # @param roc3_period [Integer]  Rate-of-change period of leg 3 (default: 20.0)
+    # @param roc4_period [Integer]  Rate-of-change period of leg 4 (default: 30.0)
+    # @param ma1_period [Integer]  Smoothing period of leg 1 (default: 10.0)
+    # @param ma2_period [Integer]  Smoothing period of leg 2 (default: 10.0)
+    # @param ma3_period [Integer]  Smoothing period of leg 3 (default: 10.0)
+    # @param ma4_period [Integer]  Smoothing period of leg 4 (default: 15.0)
+    # @param signal_period [Integer]  Smoothing period of the signal line (default: 9.0)
+    # @param rocma_type [Integer]  Type of Moving Average smoothing the four legs (default: 0.0)
+    # @param signal_ma_type [Integer]  Type of Moving Average for signal line (default: 0.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :kst  Output values
+    # @option result [Array<Float>] :kst_signal  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method kurtosis(real, time_period: 30.0)
+    # Rolling Excess Kurtosis
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 30.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method kvo(price_hlcv, fast_period: 34.0, slow_period: 55.0, signal_period: 13.0)
+    # Klinger Volume Oscillator
+    #
+    # @param price_hlcv [Array(Array<Float>, Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close, volume
+    # @param fast_period [Integer]  Period of the faster smoothing of the volume force (default: 34.0)
+    # @param slow_period [Integer]  Period of the slower smoothing of the volume force (default: 55.0)
+    # @param signal_period [Integer]  Smoothing for the trigger line (default: 13.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :kvo  Output values
+    # @option result [Array<Float>] :kvo_signal  Output values
     # @raise [TALibError]  If there is an error in function execution
 
     # @!method linearreg(real, time_period: 14.0)
     # Linear Regression
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1546,7 +1934,7 @@ module TALibFFI
     # Linear Regression Angle
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1554,7 +1942,7 @@ module TALibFFI
     # Linear Regression Intercept
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1562,7 +1950,7 @@ module TALibFFI
     # Linear Regression Slope
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1584,7 +1972,7 @@ module TALibFFI
     # Moving average
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @param ma_type [Integer]  Type of Moving Average (default: 0.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
@@ -1593,9 +1981,9 @@ module TALibFFI
     # Moving Average Convergence/Divergence
     #
     # @param real [Array<Float>]  Input values
-    # @param fast_period [Integer]  Number of period for the fast MA (default: 12.0)
-    # @param slow_period [Integer]  Number of period for the slow MA (default: 26.0)
-    # @param signal_period [Integer]  Smoothing for the signal line (nb of period) (default: 9.0)
+    # @param fast_period [Integer]  Period of the fast MA (default: 12.0)
+    # @param slow_period [Integer]  Period of the slow MA (default: 26.0)
+    # @param signal_period [Integer]  Smoothing for the signal line (period length) (default: 9.0)
     # @return [Hash]  Hash containing the following arrays:
     # @option result [Array<Float>] :macd  Output values
     # @option result [Array<Float>] :macd_signal  Output values
@@ -1606,11 +1994,11 @@ module TALibFFI
     # MACD with controllable MA type
     #
     # @param real [Array<Float>]  Input values
-    # @param fast_period [Integer]  Number of period for the fast MA (default: 12.0)
+    # @param fast_period [Integer]  Period of the fast MA (default: 12.0)
     # @param fast_ma_type [Integer]  Type of Moving Average for fast MA (default: 0.0)
-    # @param slow_period [Integer]  Number of period for the slow MA (default: 26.0)
+    # @param slow_period [Integer]  Period of the slow MA (default: 26.0)
     # @param slow_ma_type [Integer]  Type of Moving Average for slow MA (default: 0.0)
-    # @param signal_period [Integer]  Smoothing for the signal line (nb of period) (default: 9.0)
+    # @param signal_period [Integer]  Smoothing for the signal line (period length) (default: 9.0)
     # @param signal_ma_type [Integer]  Type of Moving Average for signal line (default: 0.0)
     # @return [Hash]  Hash containing the following arrays:
     # @option result [Array<Float>] :macd  Output values
@@ -1622,7 +2010,7 @@ module TALibFFI
     # Moving Average Convergence/Divergence Fix 12/26
     #
     # @param real [Array<Float>]  Input values
-    # @param signal_period [Integer]  Smoothing for the signal line (nb of period) (default: 9.0)
+    # @param signal_period [Integer]  Smoothing for the signal line (period length) (default: 9.0)
     # @return [Hash]  Hash containing the following arrays:
     # @option result [Array<Float>] :macd  Output values
     # @option result [Array<Float>] :macd_signal  Output values
@@ -1640,6 +2028,22 @@ module TALibFFI
     # @option result [Array<Float>] :fama  Output values
     # @raise [TALibError]  If there is an error in function execution
 
+    # @!method marketfi(price_hlv)
+    # Market Facilitation Index
+    #
+    # @param price_hlv [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, volume
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method massi(price_hl, fast_period: 9.0, slow_period: 25.0)
+    # Mass Index
+    #
+    # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
+    # @param fast_period [Integer]  Period of both exponential averages of the high-low range (default: 9.0)
+    # @param slow_period [Integer]  Number of bars the ratio is summed over (default: 25.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
     # @!method mavp(real, periods, min_period: 2.0, max_period: 30.0, ma_type: 0.0)
     # Moving average with variable period
     #
@@ -1655,7 +2059,7 @@ module TALibFFI
     # Highest value over a specified period
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1663,8 +2067,24 @@ module TALibFFI
     # Index of highest value over a specified period
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Integer>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method mcgd(real, time_period: 14.0)
+    # McGinley Dynamic
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 14.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method median(real, time_period: 30.0)
+    # Rolling Median
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Number of bars in the window (default: 30.0)
+    # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
     # @!method medprice(price_hl)
@@ -1678,7 +2098,7 @@ module TALibFFI
     # Money Flow Index
     #
     # @param price_hlcv [Array(Array<Float>, Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close, volume
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1686,7 +2106,7 @@ module TALibFFI
     # MidPoint over period
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1694,7 +2114,7 @@ module TALibFFI
     # Midpoint Price over period
     #
     # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1702,7 +2122,7 @@ module TALibFFI
     # Lowest value over a specified period
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1710,7 +2130,7 @@ module TALibFFI
     # Index of lowest value over a specified period
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Integer>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1718,7 +2138,7 @@ module TALibFFI
     # Lowest and highest values over a specified period
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Hash]  Hash containing the following arrays:
     # @option result [Array<Float>] :min  Output values
     # @option result [Array<Float>] :max  Output values
@@ -1728,7 +2148,7 @@ module TALibFFI
     # Indexes of lowest and highest values over a specified period
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Hash]  Hash containing the following arrays:
     # @option result [Array<Integer>] :min_idx  Output values
     # @option result [Array<Integer>] :max_idx  Output values
@@ -1738,7 +2158,7 @@ module TALibFFI
     # Minus Directional Indicator
     #
     # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1746,7 +2166,7 @@ module TALibFFI
     # Minus Directional Movement
     #
     # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1754,7 +2174,7 @@ module TALibFFI
     # Momentum
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 10.0)
+    # @param time_period [Integer]  Time period (default: 10.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1770,7 +2190,14 @@ module TALibFFI
     # Normalized Average True Range
     #
     # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method nvi(price_cv)
+    # Negative Volume Index
+    #
+    # @param price_cv [Array(Array<Float>, Array<Float>)]  Required price arrays: close, volume
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1782,11 +2209,39 @@ module TALibFFI
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
+    # @!method percentb(real, time_period: 20.0, nb_dev_up: 2.0, nb_dev_dn: 2.0, ma_type: 0.0)
+    # Bollinger Bands %B
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 20.0)
+    # @param nb_dev_up [Float]  Deviation multiplier for upper band (default: 2.0)
+    # @param nb_dev_dn [Float]  Deviation multiplier for lower band (default: 2.0)
+    # @param ma_type [Integer]  Type of Moving Average (default: 0.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method percentile(real, time_period: 100.0, percentile: 50.0)
+    # Percentile (nearest rank)
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Number of bars in the window (default: 100.0)
+    # @param percentile [Float]  Percentile to report (default: 50.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method percentrank(real, time_period: 100.0)
+    # Percent Rank
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 100.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
     # @!method plus_di(price_hlc, time_period: 14.0)
     # Plus Directional Indicator
     #
     # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1794,17 +2249,66 @@ module TALibFFI
     # Plus Directional Movement
     #
     # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
-    # @!method ppo(real, fast_period: 12.0, slow_period: 26.0, ma_type: 0.0)
+    # @!method ppo(real, fast_period: 12.0, slow_period: 26.0, ma_type: 1.0)
     # Percentage Price Oscillator
     #
     # @param real [Array<Float>]  Input values
-    # @param fast_period [Integer]  Number of period for the fast MA (default: 12.0)
-    # @param slow_period [Integer]  Number of period for the slow MA (default: 26.0)
-    # @param ma_type [Integer]  Type of Moving Average (default: 0.0)
+    # @param fast_period [Integer]  Period of the fast MA (default: 12.0)
+    # @param slow_period [Integer]  Period of the slow MA (default: 26.0)
+    # @param ma_type [Integer]  Type of Moving Average (default: 1.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method pso(price_hlc, fast_k_period: 8.0, ema_period: 5.0)
+    # Premier Stochastic Oscillator
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @param fast_k_period [Integer]  Time period for building the Fast-K line (default: 8.0)
+    # @param ema_period [Integer]  Period of each of the two smoothing passes (default: 5.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method pvi(price_cv)
+    # Positive Volume Index
+    #
+    # @param price_cv [Array(Array<Float>, Array<Float>)]  Required price arrays: close, volume
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method pvo(price_v, fast_period: 12.0, slow_period: 26.0, ma_type: 1.0)
+    # Percentage Volume Oscillator
+    #
+    # @param price_v [Array(Array<Float>)]  Required price arrays: volume
+    # @param fast_period [Integer]  Period of the fast MA (default: 12.0)
+    # @param slow_period [Integer]  Period of the slow MA (default: 26.0)
+    # @param ma_type [Integer]  Type of Moving Average (default: 1.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method pvt(price_cv)
+    # Price Volume Trend
+    #
+    # @param price_cv [Array(Array<Float>, Array<Float>)]  Required price arrays: close, volume
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method qstick(price_oc, time_period: 10.0)
+    # Qstick
+    #
+    # @param price_oc [Array(Array<Float>, Array<Float>)]  Required price arrays: open, close
+    # @param time_period [Integer]  Time period (default: 10.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method rma(real, time_period: 30.0)
+    # Wilder's Smoothed Moving Average
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1812,7 +2316,7 @@ module TALibFFI
     # Rate of change : ((price/prevPrice)-1)*100
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 10.0)
+    # @param time_period [Integer]  Time period (default: 10.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1820,7 +2324,7 @@ module TALibFFI
     # Rate of change Percentage: (price-prevPrice)/prevPrice
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 10.0)
+    # @param time_period [Integer]  Time period (default: 10.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1828,7 +2332,7 @@ module TALibFFI
     # Rate of change ratio: (price/prevPrice)
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 10.0)
+    # @param time_period [Integer]  Time period (default: 10.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1836,7 +2340,16 @@ module TALibFFI
     # Rate of change ratio 100 scale: (price/prevPrice)*100
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 10.0)
+    # @param time_period [Integer]  Time period (default: 10.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method rogerssatchell(price_ohlc, time_period: 10.0, annualization: 252.0)
+    # Rogers-Satchell Volatility
+    #
+    # @param price_ohlc [Array(Array<Float>, Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: open, high, low, close
+    # @param time_period [Integer]  Number of bars in the window (default: 10.0)
+    # @param annualization [Float]  Periods per year; 1 leaves the per-bar figure (default: 252.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1844,7 +2357,33 @@ module TALibFFI
     # Relative Strength Index
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method rvi(real, time_period: 14.0, std_dev_period: 10.0)
+    # Relative Volatility Index
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period of the Wilder smoothing applied to both legs (default: 14.0)
+    # @param std_dev_period [Integer]  Time period of the standard deviation (default: 10.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method rvir(price_hl, time_period: 14.0, std_dev_period: 10.0)
+    # Relative Volatility Index, refined high/low form
+    #
+    # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
+    # @param time_period [Integer]  Time period of the Wilder smoothing applied to both indices (default: 14.0)
+    # @param std_dev_period [Integer]  Time period of the standard deviation (default: 10.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method rvol(price_v, time_period: 20.0)
+    # Relative Volume
+    #
+    # @param price_v [Array(Array<Float>)]  Required price arrays: volume
+    # @param time_period [Integer]  Time period (default: 20.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1872,6 +2411,14 @@ module TALibFFI
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
+    # @!method si(price_ohlc, limit_move: 3.0)
+    # Wilder Swing Index
+    #
+    # @param price_ohlc [Array(Array<Float>, Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: open, high, low, close
+    # @param limit_move [Float]  Largest one-bar price move the index is scaled against, in price units (default: 3.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
     # @!method sin(real)
     # Vector Trigonometric Sin
     #
@@ -1890,8 +2437,21 @@ module TALibFFI
     # Simple Moving Average
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method smi(price_hlc, time_period: 13.0, fast_period: 2.0, slow_period: 25.0, signal_period: 9.0)
+    # Stochastic Momentum Index
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @param time_period [Integer]  Period of the high/low range (default: 13.0)
+    # @param fast_period [Integer]  Period of the second smoothing, applied to the first (default: 2.0)
+    # @param slow_period [Integer]  Period of the first smoothing, applied to the raw momentum (default: 25.0)
+    # @param signal_period [Integer]  Smoothing for the signal line (period length) (default: 9.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :smi  Output values
+    # @option result [Array<Float>] :smi_signal  Output values
     # @raise [TALibError]  If there is an error in function execution
 
     # @!method sqrt(real)
@@ -1901,11 +2461,36 @@ module TALibFFI
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
+    # @!method sqzmom(price_hlc, bb_period: 20.0, nb_dev: 2.0, kc_period: 20.0, factor_wide: 2.0, factor_normal: 1.5, factor_narrow: 1.0)
+    # Squeeze Momentum and Level
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @param bb_period [Integer]  Period of the Bollinger Bands (default: 20.0)
+    # @param nb_dev [Float]  Deviation multiplier for both Bollinger Bands (default: 2.0)
+    # @param kc_period [Integer]  Period of the Keltner Channel, and of the momentum regression (default: 20.0)
+    # @param factor_wide [Float]  Keltner width for the widest compression test (default: 2.0)
+    # @param factor_normal [Float]  Keltner width for the classic squeeze test (default: 1.5)
+    # @param factor_narrow [Float]  Keltner width for the tightest compression test (default: 1.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :momentum  Output values
+    # @option result [Array<Integer>] :squeeze  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method stc(real, fast_period: 23.0, slow_period: 50.0, cycle_period: 10.0)
+    # Schaff Trend Cycle
+    #
+    # @param real [Array<Float>]  Input values
+    # @param fast_period [Integer]  Period of the fast EMA (default: 23.0)
+    # @param slow_period [Integer]  Period of the slow EMA (default: 50.0)
+    # @param cycle_period [Integer]  Window of both stochastic stages (default: 10.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
     # @!method stddev(real, time_period: 5.0, nb_dev: 1.0)
     # Standard Deviation
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 5.0)
+    # @param time_period [Integer]  Time period (default: 5.0)
     # @param nb_dev [Float]  Nb of deviations (default: 1.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
@@ -1940,7 +2525,7 @@ module TALibFFI
     # Stochastic Relative Strength Index
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @param fast_k_period [Integer]  Time period for building the Fast-K line (default: 5.0)
     # @param fast_d_period [Integer]  Smoothing for making the Fast-D line. Usually set to 3 (default: 3.0)
     # @param fast_d_ma_type [Integer]  Type of Moving Average for Fast-D (default: 0.0)
@@ -1961,7 +2546,59 @@ module TALibFFI
     # Summation
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method supertrend(price_hlc, time_period: 10.0, multiplier: 3.0)
+    # SuperTrend
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @param time_period [Integer]  Time period for the Average True Range (default: 10.0)
+    # @param multiplier [Float]  ATR multiplier for band width (default: 3.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :supertrend  Output values
+    # @option result [Array<Integer>] :trend  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method swak_2php(real, time_period: 20.0)
+    # Swiss Army Knife - Two-Pole High-Pass Filter
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Cutoff period (default: 20.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method swak_bp(real, time_period: 20.0, delta: 0.1)
+    # Swiss Army Knife - Band-Pass Filter
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Center period (default: 20.0)
+    # @param delta [Float]  Half-bandwidth as a fraction of the center period (default: 0.1)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method swak_butter(real, time_period: 20.0)
+    # Swiss Army Knife - Butterworth Filter
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Cutoff period (default: 20.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method swak_gauss(real, time_period: 20.0)
+    # Swiss Army Knife - Gaussian Filter
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Cutoff period (default: 20.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method swak_hp(real, time_period: 20.0)
+    # Swiss Army Knife - High-Pass Filter
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Cutoff period (default: 20.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -1969,7 +2606,7 @@ module TALibFFI
     # Triple Exponential Moving Average (T3)
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 5.0)
+    # @param time_period [Integer]  Time period (default: 5.0)
     # @param v_factor [Float]  Volume Factor (default: 0.7)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
@@ -1992,7 +2629,7 @@ module TALibFFI
     # Triple Exponential Moving Average
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -2007,7 +2644,7 @@ module TALibFFI
     # Triangular Moving Average
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -2015,7 +2652,7 @@ module TALibFFI
     # 1-day Rate-Of-Change (ROC) of a Triple Smooth EMA
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -2023,7 +2660,16 @@ module TALibFFI
     # Time Series Forecast
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method tsi(real, first_period: 25.0, second_period: 13.0)
+    # True Strength Index
+    #
+    # @param real [Array<Float>]  Input values
+    # @param first_period [Integer]  Period of the first smoothing, applied to the raw momentum (default: 25.0)
+    # @param second_period [Integer]  Period of the second smoothing, applied to the first (default: 13.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -2048,9 +2694,71 @@ module TALibFFI
     # Variance
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 5.0)
+    # @param time_period [Integer]  Time period (default: 5.0)
     # @param nb_dev [Float]  Nb of deviations (default: 1.0)
     # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method vhf(real, time_period: 28.0)
+    # Vertical Horizontal Filter
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 28.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method vidya(real, time_period: 12.0, cmo_period: 9.0)
+    # Variable Index Dynamic Average
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  EMA-equivalent smoothing period, alpha = 2/(n+1) (default: 12.0)
+    # @param cmo_period [Integer]  Period of the unsmoothed CMO that scales alpha (default: 9.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method vortex(price_hlc, time_period: 14.0)
+    # Vortex Indicator
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @param time_period [Integer]  Number of bars in the rolling sums (default: 14.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :plus_vi  Output values
+    # @option result [Array<Float>] :minus_vi  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method vwap(price_hlcv)
+    # Volume Weighted Average Price
+    #
+    # @param price_hlcv [Array(Array<Float>, Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close, volume
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method vwma(real, price_v, time_period: 30.0)
+    # Volume Weighted Moving Average
+    #
+    # @param real [Array<Float>]  Input values
+    # @param price_v [Array(Array<Float>)]  Required price arrays: volume
+    # @param time_period [Integer]  Time period (default: 30.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method wad(price_hlc)
+    # Williams' Accumulation/Distribution
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method wavetrend(price_hlc, channel_period: 10.0, average_period: 21.0, signal_period: 4.0)
+    # WaveTrend Oscillator
+    #
+    # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
+    # @param channel_period [Integer]  Period of the price channel, used by both the average and the deviation (default: 10.0)
+    # @param average_period [Integer]  Smoothing for the oscillator line (default: 21.0)
+    # @param signal_period [Integer]  Simple average of the oscillator line, making the signal line (default: 4.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :wt1  Output values
+    # @option result [Array<Float>] :wt2  Output values
     # @raise [TALibError]  If there is an error in function execution
 
     # @!method wclprice(price_hlc)
@@ -2064,7 +2772,7 @@ module TALibFFI
     # Williams' %R
     #
     # @param price_hlc [Array(Array<Float>, Array<Float>, Array<Float>)]  Required price arrays: high, low, close
-    # @param time_period [Integer]  Number of period (default: 14.0)
+    # @param time_period [Integer]  Time period (default: 14.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 
@@ -2072,7 +2780,27 @@ module TALibFFI
     # Weighted Moving Average
     #
     # @param real [Array<Float>]  Input values
-    # @param time_period [Integer]  Number of period (default: 30.0)
+    # @param time_period [Integer]  Time period (default: 30.0)
+    # @return [Array<Float>]
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method zigzag(price_hl, sensitivity: 5.0, min_trend_length: 1.0)
+    # Zig Zag
+    #
+    # @param price_hl [Array(Array<Float>, Array<Float>)]  Required price arrays: high, low
+    # @param sensitivity [Float]  Minimum move away from the current extreme that reverses the leg, in percent (default: 5.0)
+    # @param min_trend_length [Integer]  Minimum number of bars between two pivots (default: 1.0)
+    # @return [Hash]  Hash containing the following arrays:
+    # @option result [Array<Float>] :zig_zag  Output values
+    # @option result [Array<Integer>] :trend  Output values
+    # @option result [Array<Integer>] :pivot_idx  Output values
+    # @raise [TALibError]  If there is an error in function execution
+
+    # @!method zlema(real, time_period: 30.0)
+    # Zero-Lag Exponential Moving Average
+    #
+    # @param real [Array<Float>]  Input values
+    # @param time_period [Integer]  Time period (default: 30.0)
     # @return [Array<Float>]
     # @raise [TALibError]  If there is an error in function execution
 

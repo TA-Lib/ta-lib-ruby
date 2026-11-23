@@ -12,17 +12,35 @@ RSpec.describe TALibFFI do
       "ACCBANDS" => %i[upper_band middle_band lower_band],
       "AROON" => %i[aroon_down aroon_up],
       "BBANDS" => %i[upper_band middle_band lower_band],
+      "CKSP" => %i[high_stop low_stop],
+      "DONCHIAN" => %i[upper_band middle_band lower_band],
+      "ERI" => %i[bull_power bear_power],
+      "FISHER" => %i[fisher trigger],
+      "FRACTAL" => %i[swing_high swing_low],
+      "HA" => %i[ha_open ha_high ha_low ha_close],
       "HT_PHASOR" => %i[in_phase quadrature],
       "HT_SINE" => %i[sine lead_sine],
+      "ICHIMOKU" => %i[tenkan_sen kijun_sen senkou_span_a senkou_span_b],
+      "KC" => %i[upper_band middle_band lower_band],
+      "KDJ" => %i[k d j],
+      "KST" => %i[kst kst_signal],
+      "KSTEXT" => %i[kst kst_signal],
+      "KVO" => %i[kvo kvo_signal],
       "MACD" => %i[macd macd_signal macd_hist],
       "MACDEXT" => %i[macd macd_signal macd_hist],
       "MACDFIX" => %i[macd macd_signal macd_hist],
       "MAMA" => %i[mama fama],
       "MINMAX" => %i[min max],
       "MINMAXINDEX" => %i[min_idx max_idx],
+      "SMI" => %i[smi smi_signal],
+      "SQZMOM" => %i[momentum squeeze],
       "STOCH" => %i[slow_k slow_d],
       "STOCHF" => %i[fast_k fast_d],
-      "STOCHRSI" => %i[fast_k fast_d]
+      "STOCHRSI" => %i[fast_k fast_d],
+      "SUPERTREND" => %i[supertrend trend],
+      "VORTEX" => %i[plus_vi minus_vi],
+      "WAVETREND" => %i[wt1 wt2],
+      "ZIGZAG" => %i[zig_zag trend pivot_idx]
     }
   end
 
@@ -65,6 +83,20 @@ RSpec.describe TALibFFI do
     it ".#{function.name.downcase} matches TA_#{function.name} with its default parameters" do
       expected = c_result(function, series)
       expect(ruby_result(function, series)).to eql(expected)
+    end
+  end
+
+  [[3.0, 1.0, 1.0, 2.0, 5.0], [2.0, 2.0, 2.0, 2.0, 2.0]].each do |prices|
+    it ".minmaxindex follows the installed library's tie handling for #{prices.inspect}" do
+      expected = c_result(functions.fetch("MINMAXINDEX"), { "inReal" => prices }, [3])
+      expect(described_class.minmaxindex(prices, time_period: 3)).to eql(expected)
+    end
+  end
+
+  if functions.key?("ALMA")
+    it ".alma maps sigma and offset to the direct C parameters" do
+      expected = c_result(functions.fetch("ALMA"), series, [4, 4.0, 0.75])
+      expect(described_class.alma(series.fetch("inReal"), offset: 0.75, time_period: 4, sigma: 4.0)).to eql(expected)
     end
   end
 
