@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed HTML documentation generation on Ruby 4. The local API reference includes the indicators and defaults from the selected TA-Lib C library.
 - Fixed unbounded memory growth during repeated indicator calls. Numeric arrays are packed in bulk, and Ruby owns the input and output buffers for the duration of each call.
 - Invalid input counts, incorrectly grouped price fields, unequal lengths and unknown keywords raise `TALibFFI::TALibError` with details. Previously unknown keywords silently used the default.
 

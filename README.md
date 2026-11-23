@@ -92,7 +92,10 @@ TALibFFI.alma(prices, time_period: 4, sigma: 4.0, offset: 0.75).map { |v| v.roun
 Use `TALibFFI.respond_to?(:alma)` to check availability. Defaults come from the installed C library. For example, the default BBANDS period is 5 in 0.6.4 and 20 in 0.8.3. Pass `time_period:` explicitly to use the same window on both.
 
 ## Documentation
-- [API Documentation](https://www.rubydoc.info/github/TA-Lib/ta-lib-ruby/main) - Detailed documentation of all available methods and classes
+
+The gem ships indicator signatures generated from TA-Lib 0.8.3. [API reference](https://www.rubydoc.info/github/TA-Lib/ta-lib-ruby/main)
+
+From a checkout with the development dependencies installed, run `bundle exec rake yard` to generate `doc/TALibFFI.html` for your installed C library. The task also updates the YARD comments in `lib/ta_lib_ffi.rb` with that library's indicators and parameter defaults. Set `TA_LIB_PATH` to select a specific shared library.
 
 ## TODO
 - [ ] Add RDoc documentation for Ruby methods
@@ -102,8 +105,6 @@ Use `TALibFFI.respond_to?(:alma)` to check availability. Defaults come from the 
 ## Development
 
 Run `bundle exec rspec spec/ta_lib_ffi_c_reference_spec.rb` to compare each Ruby indicator with its corresponding C function in the installed TA-Lib library. Both receive the same data. The suite checks every returned value, its numeric type, the output length and the keys of multi-output results.
-
-Run `bundle exec rake yard` with TA-Lib 0.8.3 to regenerate the published method signatures.
 
 1. Fork the repository
 2. Create your feature branch (`git checkout -b feature/amazing-feature`)

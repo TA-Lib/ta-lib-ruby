@@ -65,7 +65,7 @@ GEM
       unicode-emoji (~> 4.0, >= 4.0.4)
     unicode-emoji (4.3.0)
     webrick (1.9.1)
-    yard (0.9.37)
+    yard (0.9.45)
 
 PLATFORMS
   ruby
@@ -79,7 +79,7 @@ DEPENDENCIES
   ruby-lsp-rspec (~> 0.1.20)
   ta_lib_ffi!
   webrick (~> 1.9)
-  yard (~> 0.9)
+  yard (~> 0.9.40)
 
 BUNDLED WITH
    2.5.6
