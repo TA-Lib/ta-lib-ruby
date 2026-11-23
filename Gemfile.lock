@@ -24,6 +24,7 @@ GEM
     rbs (3.8.1)
       logger
     regexp_parser (2.10.0)
+    rexml (3.4.4)
     rspec (3.13.0)
       rspec-core (~> 3.13.0)
       rspec-expectations (~> 3.13.0)
@@ -72,6 +73,7 @@ PLATFORMS
 
 DEPENDENCIES
   rake (~> 13.2)
+  rexml (~> 3.3)
   rspec (~> 3.13)
   rubocop-rspec (~> 3.3)
   ruby-lsp-rspec (~> 0.1.20)

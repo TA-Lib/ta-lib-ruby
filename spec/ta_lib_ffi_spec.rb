@@ -26,10 +26,6 @@ RSpec.describe TALibFFI do
     it "has a version number" do
       expect(described_class::VERSION).to eq("0.3.0")
     end
-
-    it "returns a string for TA-Lib version", skip: "Not implemented under Windows" do
-      expect(described_class.ta_lib_version).to be_a(String)
-    end
   end
 
   describe "Math Operators" do
@@ -84,9 +80,8 @@ RSpec.describe TALibFFI do
 
     describe "#max" do
       it "calculates highest value over default period (30)" do
-        prices = Array.new(50) { rand(100) }
-        result = described_class.max(prices)
-        expect(result.length).to eq(prices.length - 29)
+        result = described_class.max((1..50).to_a)
+        expect(result).to eq((30..50).to_a)
       end
 
       it "calculates highest value over specified period" do
@@ -946,9 +941,10 @@ RSpec.describe TALibFFI do
       end
 
       it "handles constant price series" do
-        constant_prices = Array.new(200) { rand(9.0..11.0) }
+        constant_prices = Array.new(200, 10.0)
         result = described_class.ht_trendline(constant_prices)
-        expect(result).to all(be_within(1).of(10.0))
+        expect(result).not_to be_empty
+        expect(result).to all(be_within(0.000001).of(10.0))
       end
     end
 
@@ -1041,7 +1037,7 @@ RSpec.describe TALibFFI do
     end
 
     describe "#mavp" do
-      let(:periods) { [2.0, 3.0, 4.0, 5.0, 4.0, 3.0, 2.0, 3.0, 4.0, 5.0] }
+      let(:periods) { [2.0, 3.0, 4.0, 5.0, 4.0, 3.0, 2.0, 3.0, 4.0, 5.0, 4.0] }
 
       it_behaves_like "ta_lib_input_validation", :mavp
 
@@ -1143,136 +1139,13 @@ RSpec.describe TALibFFI do
         expect { described_class.sar([high_prices, low_prices], maximum: -0.2) }.to raise_error(described_class::TALibError)
       end
     end
-
-    describe "#sarext", skip: "Needs implementation review" do
-      it "calculates Parabolic SAR - Extended" do
-        result = described_class.sarext(high_prices, low_prices)
-        expect(result).to be_an(Array)
-        expect(result.length).to be <= high_prices.length
-      end
-    end
-
-    describe "#sma", skip: "Needs implementation review" do
-      it "calculates Simple Moving Average" do
-        result = described_class.sma(close_prices, time_period: 5)
-        expect(result).to be_an(Array)
-        expect(result.length).to eq(6)
-      end
-
-      it "uses default time period (30) when not specified" do
-        result = described_class.sma(close_prices)
-        expect(result.length).to eq([close_prices.length - 29, 0].max)
-      end
-
-      it "returns empty array when period exceeds data length" do
-        result = described_class.sma(close_prices, time_period: close_prices.length + 1)
-        expect(result).to be_empty
-      end
-
-      it "handles constant price series" do
-        constant_prices = Array.new(10, 10.0)
-        result = described_class.sma(constant_prices, time_period: 3)
-        expect(result).to all(be_within(0.000001).of(10.0))
-      end
-    end
-
-    describe "#t3", skip: "Needs implementation review" do
-      it "calculates Triple Exponential Moving Average (T3)" do
-        result = described_class.t3(close_prices, time_period: 5)
-        expect(result).to be_an(Array)
-      end
-
-      it "uses default parameters when not specified" do
-        result = described_class.t3(close_prices)
-        expect(result.length).to be <= close_prices.length
-      end
-
-      it "handles custom volume factor" do
-        result = described_class.t3(close_prices, time_period: 5, volume_factor: 0.7)
-        expect(result).to be_an(Array)
-      end
-
-      it "handles constant price series" do
-        constant_prices = Array.new(50, 10.0)
-        result = described_class.t3(constant_prices, time_period: 5)
-        expect(result).to all(be_within(0.000001).of(10.0))
-      end
-    end
-
-    describe "#tema", skip: "Needs implementation review" do
-      it "calculates Triple Exponential Moving Average" do
-        result = described_class.tema(close_prices, time_period: 5)
-        expect(result).to be_an(Array)
-        expect(result.length).to be <= close_prices.length
-      end
-
-      it "uses default time period (30) when not specified" do
-        result = described_class.tema(close_prices)
-        expect(result.length).to be <= close_prices.length
-      end
-
-      it "returns empty array when period exceeds data length" do
-        result = described_class.tema(close_prices, time_period: close_prices.length + 1)
-        expect(result).to be_empty
-      end
-
-      it "handles constant price series" do
-        constant_prices = Array.new(50, 10.0)
-        result = described_class.tema(constant_prices, time_period: 5)
-        expect(result).to all(be_within(0.000001).of(10.0))
-      end
-    end
-
-    describe "#trima", skip: "Needs implementation review" do
-      it "calculates Triangular Moving Average" do
-        result = described_class.trima(close_prices, time_period: 5)
-        expect(result).to be_an(Array)
-        expect(result.length).to eq(6)
-      end
-
-      it "uses default time period (30) when not specified" do
-        result = described_class.trima(close_prices)
-        expect(result.length).to eq([close_prices.length - 29, 0].max)
-      end
-
-      it "returns empty array when period exceeds data length" do
-        result = described_class.trima(close_prices, time_period: close_prices.length + 1)
-        expect(result).to be_empty
-      end
-
-      it "handles constant price series" do
-        constant_prices = Array.new(10, 10.0)
-        result = described_class.trima(constant_prices, time_period: 3)
-        expect(result).to all(be_within(0.000001).of(10.0))
-      end
-    end
-
-    describe "#wma", skip: "Needs implementation review" do
-      it "calculates Weighted Moving Average" do
-        result = described_class.wma(close_prices, time_period: 5)
-        expect(result).to be_an(Array)
-        expect(result.length).to eq(6)
-      end
-
-      it "uses default time period (30) when not specified" do
-        result = described_class.wma(close_prices)
-        expect(result.length).to eq([close_prices.length - 29, 0].max)
-      end
-
-      it "returns empty array when period exceeds data length" do
-        result = described_class.wma(close_prices, time_period: close_prices.length + 1)
-        expect(result).to be_empty
-      end
-
-      it "handles constant price series" do
-        constant_prices = Array.new(10, 10.0)
-        result = described_class.wma(constant_prices, time_period: 3)
-        expect(result).to all(be_within(0.000001).of(10.0))
-      end
-    end
   end
 
   describe "Function Information" do
+    it "exposes the native indicator descriptions" do
+      expect(described_class.function_description_xml).to include("<Abbreviation>SMA</Abbreviation>")
+    end
+
     it "can get function groups" do
       groups = described_class.group_table
       expect(groups).to be_an(Array)

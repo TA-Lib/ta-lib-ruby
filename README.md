@@ -88,6 +88,8 @@ result = TALibFFI.atr([high, low, close], time_period: 5)
 
 ## Development
 
+Run `bundle exec rspec spec/ta_lib_ffi_c_reference_spec.rb` to compare each Ruby indicator with its corresponding C function in the installed TA-Lib library. Both receive the same data. The suite checks every returned value, its numeric type, the output length and the keys of multi-output results.
+
 1. Fork the repository
 2. Create your feature branch (`git checkout -b feature/amazing-feature`)
 3. Commit your changes (`git commit -am 'Add some amazing feature'`)
