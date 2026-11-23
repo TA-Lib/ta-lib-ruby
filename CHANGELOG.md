@@ -5,12 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - Unreleased
+## [0.4.0] - 2026-11-23
 
 ### Added
 
 - Support for the TA-Lib 0.8.3 function metadata layout and indicators, including ALMA, alongside 0.6.4. Set `TA_LIB_PATH` to select a particular shared library.
-- Direct C comparisons for the indicators in each installed library and Linux CI coverage for the latest stable Ruby 4.x.
+- Direct C comparisons for the indicators in each installed library and CI coverage for the latest stable Ruby 4.x.
 
 ### Fixed
 
@@ -69,7 +69,7 @@ Indicator defaults and results follow the installed TA-Lib version. This include
 ### Security
 - N/A
 
-[0.4.0]: https://github.com/TA-Lib/ta-lib-ruby/compare/v0.3.0...main
+[0.4.0]: https://github.com/TA-Lib/ta-lib-ruby/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/TA-Lib/ta-lib-ruby/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/TA-Lib/ta-lib-ruby/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/TA-Lib/ta-lib-ruby/releases/tag/v0.1.0

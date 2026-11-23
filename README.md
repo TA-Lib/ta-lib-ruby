@@ -1,121 +1,85 @@
 # TALibFFI
 
-![Tests](https://github.com/TA-Lib/ta-lib-ruby/actions/workflows/main.yml/badge.svg)
-[![Gem Version](https://badge.fury.io/rb/ta_lib_ffi.svg?icon=si%3Arubygems)](https://badge.fury.io/rb/ta_lib_ffi)
+[![Tests](https://github.com/TA-Lib/ta-lib-ruby/actions/workflows/main.yml/badge.svg)](https://github.com/TA-Lib/ta-lib-ruby/actions/workflows/main.yml)
+[![Gem version](https://badge.fury.io/rb/ta_lib_ffi.svg)](https://rubygems.org/gems/ta_lib_ffi)
 
-## Introduction
+`ta_lib_ffi` exposes the technical indicators in your installed TA-Lib C library as Ruby methods. A three-period simple moving average returns its first value at the third price.
 
-TALibFFI is a Ruby binding for [TA-Lib](https://ta-lib.org/) (Technical Analysis Library) using FFI (Foreign Function Interface). It exposes the indicators provided by the installed C library.
+```ruby
+require "ta_lib_ffi"
 
-## Requirements
-
-- Ruby >= 3.1.0 (Linux CI tests the latest stable Ruby 4.x with TA-Lib 0.6.4 and 0.8.3)
-- TA-Lib >= 0.6.4
+close = [10, 11, 12, 13, 14]
+TALibFFI.sma(close, time_period: 3)
+# => [11.0, 12.0, 13.0]
+```
 
 ## Installation
 
-### [Install TA-Lib](https://ta-lib.org/install/)
+You need Ruby 3.1 or later and the TA-Lib C shared library 0.6.4 or later. If you already use C library 0.6.4, you can keep it when upgrading the gem to 0.4.0.
 
-#### Windows
-Download and run the [ta-lib-0.8.3-windows-x86_64.msi](https://github.com/ta-lib/ta-lib/releases/download/v0.8.3/ta-lib-0.8.3-windows-x86_64.msi)
+- **macOS** — Run `brew install ta-lib`.
+- **Debian or Ubuntu** — Download the `.deb` matching `dpkg --print-architecture`. For example, on `amd64`, install the downloaded file with `sudo dpkg -i ./ta-lib_0.8.3_amd64.deb`. [Debian packages](https://ta-lib.org/install/c/#linux-debian-packages)
+- **Windows x64** — Run the [TA-Lib 0.8.3 x64 installer](https://github.com/TA-Lib/ta-lib/releases/download/v0.8.3/ta-lib-0.8.3-windows-x86_64.msi).
 
-#### macOS
-```bash
-brew install ta-lib
-```
+For a custom installation, set `TA_LIB_PATH` to the full path of the shared library (`.so`, `.dylib` or `.dll`) before requiring the gem. [TA-Lib installation guide](https://ta-lib.org/install/c/)
 
-#### Linux (Debian/Ubuntu)
-```bash
-# For Intel/AMD 64-bit
-wget https://github.com/ta-lib/ta-lib/releases/download/v0.8.3/ta-lib_0.8.3_amd64.deb
-sudo dpkg -i ta-lib_0.8.3_amd64.deb
+Add the gem to your application with `bundle add ta_lib_ffi`, or install it directly with `gem install ta_lib_ffi`.
 
-# For ARM64
-wget https://github.com/ta-lib/ta-lib/releases/download/v0.8.3/ta-lib_0.8.3_arm64.deb
-sudo dpkg -i ta-lib_0.8.3_arm64.deb
+## Inputs and results
 
-# For Intel/AMD 32-bits
-wget https://github.com/ta-lib/ta-lib/releases/download/v0.8.3/ta-lib_0.8.3_i386.deb
-sudo dpkg -i ta-lib_0.8.3_i386.deb
-```
-
-For a custom installation, set `TA_LIB_PATH` to the full path of the shared library (`.so`, `.dylib` or `.dll`) before requiring the gem.
-
-### [Installing the Ruby Gem](https://rubygems.org/gems/ta_lib_ffi)
-
-Add this to your application's Gemfile:
+Pass price fields together in the order the indicator expects. For Average True Range (ATR), pass high, low and close as one argument. All input series must be nonempty and have the same length.
 
 ```ruby
-gem 'ta_lib_ffi'
+high  = [11, 13, 12, 14, 15]
+low   = [9, 10, 9, 11, 12]
+close = [10, 12, 10, 13, 14]
+
+TALibFFI.atr([high, low, close], time_period: 2)
+# => [3.0, 3.5, 3.25]
 ```
 
-Then execute:
-
-    $ bundle install
-
-Or install it directly:
-
-    $ gem install ta_lib_ffi
-
-## Usage
+Single-output indicators return an array. Indicators with several outputs return a hash of arrays keyed by output name. Each array starts at the first input position for which the indicator has enough history.
 
 ```ruby
-require 'ta_lib_ffi'
-
-# Initialize data
-prices = [10.0, 11.0, 12.0, 11.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0]
-
-# Calculate SMA
-puts TALibFFI.sma(prices, time_period: 3)
-# => [11.0, 11.333333333333334, 11.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0]
-
-# Average True Range (ATR) Example
-high = [82.15, 81.89, 83.03, 83.30, 83.85, 83.90, 83.33, 84.30, 84.84, 85.00, 85.90, 86.58, 86.98, 88.00, 87.87]
-low  = [81.29, 80.64, 81.31, 82.65, 83.07, 83.11, 82.49, 82.30, 84.15, 84.11, 84.03, 85.39, 85.76, 87.17, 87.01]
-close = [81.59, 81.06, 82.87, 83.00, 83.61, 83.15, 82.84, 83.99, 84.55, 84.36, 85.53, 86.54, 86.89, 87.77, 87.29]
-
-# Calculate ATR with period = 5
-result = TALibFFI.atr([high, low, close], time_period: 5)
-# => [1.101999999999998, 1.0495999999999992, 1.2396799999999994, 1.1617440000000012, 1.1073952000000011, ...]
+TALibFFI.minmax([12, 10, 14, 11, 13], time_period: 3)
+# => { min: [10.0, 10.0, 11.0], max: [14.0, 14.0, 14.0] }
 ```
 
-Pass price fields together in the documented order, as in the ATR example. Every input series must have the same nonzero length. A misspelled keyword raises `TALibFFI::TALibError` and lists the accepted keywords.
+## C library compatibility
 
-TA-Lib 0.8.3 also provides the Arnaud Legoux Moving Average.
+The loaded C library determines which methods are available and their default parameters. CI tests Ruby 3.1 through the latest stable Ruby 4.x across Linux, macOS and Windows with TA-Lib C 0.6.4 and 0.8.3.
+
+| TA-Lib C | Indicators | Default BBANDS period | ALMA available |
+| --- | ---: | ---: | --- |
+| 0.6.4 | 161 | 5 | No |
+| 0.7.1 | 161 | 5 | No |
+| 0.8.1 | 201 | 20 | No |
+| 0.8.3 | 237 | 20 | Yes |
+
+Pass `time_period:` explicitly to use the same BBANDS window across versions. Use `respond_to?` when calling an indicator that some installations may lack, such as the Arnaud Legoux Moving Average (ALMA), or inspect `TALibFFI.group_table` and `TALibFFI.function_table(group)` to list loaded indicators.
 
 ```ruby
-prices = (1..8).map(&:to_f)
-TALibFFI.alma(prices, time_period: 4, sigma: 4.0, offset: 0.75).map { |v| v.round(4) }
-# => [2.8847, 3.8847, 4.8847, 5.8847, 6.8847]
+if TALibFFI.respond_to?(:alma)
+  prices = (1..8).map(&:to_f)
+  TALibFFI.alma(prices, time_period: 4, sigma: 4.0, offset: 0.75).map { |value| value.round(4) }
+  # => [2.8847, 3.8847, 4.8847, 5.8847, 6.8847]
+end
 ```
 
-Use `TALibFFI.respond_to?(:alma)` to check availability. Defaults come from the installed C library. For example, the default BBANDS period is 5 in 0.6.4 and 20 in 0.8.3. Pass `time_period:` explicitly to use the same window on both.
+When upgrading to gem 0.4.0, check your keyword arguments. A misspelling such as `timeperiod:` now raises `TALibFFI::TALibError` and the error lists the accepted keywords. [Changelog](CHANGELOG.md)
 
-## Documentation
+## API documentation
 
-The gem ships indicator signatures generated from TA-Lib 0.8.3. [API reference](https://www.rubydoc.info/github/TA-Lib/ta-lib-ruby/main)
+The gem ships method signatures generated with TA-Lib C 0.8.3. [Online API reference](https://www.rubydoc.info/github/TA-Lib/ta-lib-ruby/main/TALibFFI)
 
-From a checkout with the development dependencies installed, run `bundle exec rake yard` to generate `doc/TALibFFI.html` for your installed C library. The task also updates the YARD comments in `lib/ta_lib_ffi.rb` with that library's indicators and parameter defaults. Set `TA_LIB_PATH` to select a specific shared library.
-
-## TODO
-- [ ] Add RDoc documentation for Ruby methods
-- [ ] Create detailed function examples with input/output samples
-- [ ] Add more tests for each function
+To build the reference for your installed C library, run `bundle install` and `bundle exec rake yard` from a checkout, then open `doc/TALibFFI.html`. The task also updates the generated method comments in `lib/ta_lib_ffi.rb`. Use TA-Lib C 0.8.3 when refreshing the signatures for this release.
 
 ## Development
 
-Run `bundle exec rspec spec/ta_lib_ffi_c_reference_spec.rb` to compare each Ruby indicator with its corresponding C function in the installed TA-Lib library. Both receive the same data. The suite checks every returned value, its numeric type, the output length and the keys of multi-output results.
+From a checkout, run `bundle install` followed by `bundle exec rake` to run RSpec and RuboCop. To run just the C comparison tests, use `bundle exec rspec spec/ta_lib_ffi_c_reference_spec.rb`. They call each indicator through Ruby and directly through the installed C library with the same inputs, then compare output values, types, lengths and keys.
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -am 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Create a Pull Request
-
-## Contributing
-
-Bug reports and pull requests are welcome on GitHub at https://github.com/TA-Lib/ta-lib-ruby
+Bug reports and pull requests are welcome. [GitHub repository](https://github.com/TA-Lib/ta-lib-ruby)
 
 ## License
 
-This gem is available as open source under the terms of the [MIT License](LICENSE).
+[MIT License](LICENSE.txt)
