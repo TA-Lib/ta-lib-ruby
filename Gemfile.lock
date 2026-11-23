@@ -63,7 +63,7 @@ GEM
     sorbet-runtime (0.5.11766)
     unicode-display_width (3.1.4)
       unicode-emoji (~> 4.0, >= 4.0.4)
-    unicode-emoji (4.0.4)
+    unicode-emoji (4.3.0)
     webrick (1.9.1)
     yard (0.9.37)
 

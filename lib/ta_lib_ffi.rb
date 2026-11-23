@@ -2,6 +2,7 @@
 
 require "fiddle"
 require "fiddle/import"
+require_relative "ta_lib_ffi/version"
 
 # Ruby FFI wrapper for TA-Lib (Technical Analysis Library)
 #
@@ -18,8 +19,6 @@ require "fiddle/import"
 #
 # @see https://ta-lib.org/ TA-Lib Official Website
 module TALibFFI
-  VERSION = "0.3.0"
-
   if defined?(Zeitwerk)
     # https://github.com/fxn/zeitwerk?tab=readme-ov-file#custom-inflector
     # @!visibility private

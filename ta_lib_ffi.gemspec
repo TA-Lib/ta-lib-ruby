@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require_relative "lib/ta_lib_ffi"
+require_relative "lib/ta_lib_ffi/version"
 
 Gem::Specification.new do |spec|
   spec.name = "ta_lib_ffi"
