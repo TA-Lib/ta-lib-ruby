@@ -70,9 +70,9 @@ When upgrading to gem 0.4.0, check your keyword arguments. A misspelling such as
 
 ## API documentation
 
-The gem ships method signatures generated with TA-Lib C 0.8.3. [Online API reference](https://www.rubydoc.info/github/TA-Lib/ta-lib-ruby/main/TALibFFI)
+The gem ships method signatures generated with TA-Lib C 0.8.3. [API reference for gem 0.4.0](https://gemdocs.org/gems/ta_lib_ffi/0.4.0/TALibFFI.html)
 
-To build the reference for your installed C library, run `bundle install` and `bundle exec rake yard` from a checkout, then open `doc/TALibFFI.html`. The task also updates the generated method comments in `lib/ta_lib_ffi.rb`. Use TA-Lib C 0.8.3 when refreshing the signatures for this release.
+For an offline copy, run `bundle install` and `bundle exec yard doc` from the release checkout, then open `doc/TALibFFI.html`. To regenerate the reference from your installed C library, run `bundle exec rake yard`. That task also updates the generated method comments in `lib/ta_lib_ffi.rb`. Use TA-Lib C 0.8.3 when refreshing the signatures for this release.
 
 ## Development
 
